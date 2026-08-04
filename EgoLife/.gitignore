@@ -1,0 +1,29 @@
+# --- Secrets ---
+.env
+
+# --- Downloaded data (large, regenerable) ---
+videos/
+EgoLifeCap/
+
+# --- HuggingFace cache ---
+.cache/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Caption pipeline intermediate/cache outputs ---
+# Keep only the main annotation jsonl; drop usage logs, run logs, summaries,
+# and the re-encoded slice cache.
+captions/**/_cache/
+captions/**/*_usage.jsonl
+captions/**/*_summary.json
+captions/**/*_run.log
+captions/**/*.log
+
+# --- OS/editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*~

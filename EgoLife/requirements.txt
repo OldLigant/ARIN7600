@@ -1,0 +1,13 @@
+# caption_pipeline.py
+openai>=1.0
+pandas>=2.0
+python-dotenv>=1.0
+jsonschema>=4.0
+
+# download_video.py (and download_egolifecap.py --method hf)
+huggingface_hub>=0.20
+
+# NOTE: ffmpeg/ffprobe must also be installed and on PATH (not a pip package).
+#   Windows: winget install Gyan.FFmpeg
+#   macOS:   brew install ffmpeg
+#   Linux:   sudo apt install ffmpeg
