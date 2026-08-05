@@ -3,6 +3,7 @@ openai>=1.0
 pandas>=2.0
 python-dotenv>=1.0
 jsonschema>=4.0
+tqdm>=4.65
 
 # download_video.py (and download_egolifecap.py --method hf)
 huggingface_hub>=0.20

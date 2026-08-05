@@ -55,6 +55,11 @@ try:
 except ImportError:
     jsonschema = None
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 ROOT = Path(__file__).resolve().parent  # .../ARIN7600/EgoLife/
 
 # ===========================================================================
@@ -844,7 +849,7 @@ def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg):
             return resp, time.time() - t0, attempt
         except Exception as e:
             last_exc = e
-            log.warning(f"[{clip_id}] API attempt {attempt} failed: {type(e).__name__}: {e}")
+            log.debug(f"[{clip_id}] API attempt {attempt} failed: {type(e).__name__}: {e}")
             if attempt < 2:
                 time.sleep(min(2 ** attempt, 30))
     raise last_exc
@@ -861,8 +866,6 @@ def _process_one_clip_limited(client, model, video_path, clip_row, is_10s, log, 
 
 
 def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, worker_id):
-    call_kwargs = dict(thinking=cfg.thinking,
-                       max_completion_tokens=cfg.max_completion_tokens, json_mode=cfg.json_mode)
     while True:
         job = in_q.get()
         if job is None:
@@ -883,49 +886,70 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
         try:
             cap_rec, use_rec, content = _process_one_clip_limited(
                 client, model, slice_path, row, False, log, limiter, cfg)
-            reason = ""
+            use_rec2 = None
             if cap_rec is None:
                 reason = use_rec.recovery
-                log.warning(f"[{clip_id}] attempt 1 failed ({reason}) - retrying once")
-                cap_rec, use_rec2, content2 = _process_one_clip_limited(
-                    client, model, slice_path, row, False, log, limiter, cfg)
+                # Mimo often rejects the very first video request; the second
+                # request hits the cheap prefix cache and almost always succeeds.
+                # Treat this as normal, not a crisis.
+                use_rec.recovery = "first_attempt_rejection"
                 usage_records.append(use_rec)
+                log.info(f"[{clip_id}] first attempt returned '{reason}'; retrying once "
+                         f"(normal for Mimo, retry is cheap via prefix cache)")
+                try:
+                    cap_rec, use_rec2, content2 = _process_one_clip_limited(
+                        client, model, slice_path, row, False, log, limiter, cfg)
+                except Exception as e:
+                    log.warning(f"[{clip_id}] retry crashed: {type(e).__name__}: {e}")
+                    cap_rec = None
+                    use_rec2 = None
+
             if cap_rec is None:
-                log.warning(f"[{clip_id}] still failing - falling back to 10s slices")
+                reason2 = use_rec2.recovery if use_rec2 is not None else "retry_failed"
+                if use_rec2 is not None:
+                    usage_records.append(use_rec2)
+                log.warning(f"[{clip_id}] second attempt also failed ({reason2}); "
+                            f"falling back to ~10s slices")
                 try:
                     slice_paths = slice_to_10s(slice_path, clip_id, tmp_10s_dir)
                 except Exception as e:
                     log.error(f"[{clip_id}] 10s slicing failed: {e}")
                     failures.append({"clip_id": clip_id, "global_idx": gid, "error": f"slice_failed: {e}",
-                                     "reason": reason, "raw_content_preview": (content or "")[:200]})
+                                     "reason": reason2, "raw_content_preview": (content or "")[:200]})
                     out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
                                         usage_records=usage_records, failures=failures))
                     in_q.task_done()
                     continue
+                log.info(f"[{clip_id}] sliced into {len(slice_paths)} pieces; captioning each ~10s clip")
                 ten_s_ok = 0
                 for sp in slice_paths:
                     sub_row = row.copy()
                     sub_row["clip_id"] = f"{clip_id}_10s_{ten_s_ok + 1}"
                     sub_row["duration"] = 10.0
-                    sub_cap, sub_use, _ = _process_one_clip_limited(
-                        client, model, sp, sub_row, True, log, limiter, cfg)
+                    try:
+                        sub_cap, sub_use, _ = _process_one_clip_limited(
+                            client, model, sp, sub_row, True, log, limiter, cfg)
+                    except Exception as e:
+                        log.warning(f"[{clip_id}] 10s slice {sp.name} failed: {type(e).__name__}: {e}")
+                        continue
                     if sub_cap is not None:
                         sub_cap.recovery = "10s_slices"
                         caption_records.append(sub_cap)
                         usage_records.append(sub_use)
                         ten_s_ok += 1
-                        log.info(f"[{clip_id}] 10s slice {sp.name} OK")
+                        log.info(f"[{clip_id}] 10s slice {sp.name} succeeded")
                     else:
-                        log.warning(f"[{clip_id}] 10s slice {sp.name} also failed")
+                        log.warning(f"[{clip_id}] 10s slice {sp.name} rejected/parse-failed")
+                log.info(f"[{clip_id}] 10s fallback result: {ten_s_ok}/{len(slice_paths)} slices succeeded")
                 if ten_s_ok == 0:
                     failures.append({"clip_id": clip_id, "global_idx": gid, "error": "all_attempts_failed",
-                                     "reason": reason, "raw_content_preview": (content or "")[:200]})
+                                     "reason": reason2, "raw_content_preview": (content or "")[:200]})
             else:
                 caption_records.append(cap_rec)
-                if not usage_records:
-                    usage_records.append(use_rec)
-                elif cap_rec is not None:
+                if use_rec2 is not None:
                     usage_records.append(use_rec2)
+                elif not usage_records:
+                    usage_records.append(use_rec)
         except Exception as e:
             log.error(f"[{clip_id}] worker crash: {type(e).__name__}: {e}")
             failures.append({"clip_id": clip_id, "global_idx": gid,
@@ -987,6 +1011,29 @@ class OrderedWriter:
                 self.log.warning(f"[writer] {len(self._heap)} results never flushed (missing global_idx)")
             self.cap_f.close()
             self.use_f.close()
+
+
+# ===========================================================================
+# Logging helper that plays nicely with tqdm
+# ===========================================================================
+
+class TqdmLoggingHandler(logging.Handler):
+    """Emit log records through tqdm.write() so messages stay above an
+    active progress bar instead of destroying it."""
+
+    def __init__(self, level: int = logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if tqdm is not None:
+                tqdm.write(msg, file=sys.stdout)
+            else:
+                sys.stdout.write(msg + "\n")
+                sys.stdout.flush()
+        except Exception:
+            self.handleError(record)
 
 
 # ===========================================================================
@@ -1148,8 +1195,12 @@ def main():
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(fmt); log.addHandler(fh)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt); log.addHandler(sh)
+    if tqdm is not None:
+        th = TqdmLoggingHandler()
+        th.setFormatter(fmt); log.addHandler(th)
+    else:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt); log.addHandler(sh)
 
     json_mode = not args.no_json_mode
     cfg = ApiCallConfig(args.thinking, args.max_completion_tokens, json_mode)
@@ -1199,7 +1250,8 @@ def main():
     # --- Stats ---
     all_usage, all_records, all_failures = [], [], []
     outcome_counts = {OUTCOME_OK: 0, OUTCOME_SAFETY: 0, OUTCOME_PARSE_FAILED: 0,
-                      OUTCOME_EMPTY: 0, "fallback_sectioned": 0, "10s_slices": 0}
+                      OUTCOME_EMPTY: 0, "fallback_sectioned": 0, "10s_slices": 0,
+                      "first_attempt_rejection": 0}
     skipped_existing = 0
     t_start = time.time()
 
@@ -1241,6 +1293,13 @@ def main():
             pp_job_q.put(None)
         pp_done, pp_expected, api_fed = False, expected_total, 0
 
+    # --- Progress bar ---
+    pbar = None
+    if tqdm is not None and expected_total > 0:
+        pbar = tqdm(total=expected_total, unit="clip", desc="captioning",
+                    mininterval=0.5, smoothing=0.3)
+        pbar.refresh()
+
     # --- API worker pool ---
     api_threads = []
     for w in range(args.api_workers):
@@ -1278,17 +1337,40 @@ def main():
         if not args.skip_preprocess and pp_received >= pp_expected:
             pp_done = True
 
-    # Heartbeat progress log: the success path is otherwise silent (no per-clip log on ok),
-    # so without a periodic tick you stare at warnings-only output for minutes. One line per
-    # minute is loud enough to reassure, quiet enough not to drown the real warnings.
+    # Progress feedback: tqdm bar updates per finished clip. If tqdm is not
+    # installed we fall back to the old 60-second heartbeat log line.
     PROGRESS_INTERVAL_S = 60.0
     last_progress_t = time.time()
+    pbar_total_adjusted = False
+
+    def _update_pbar():
+        if pbar is None:
+            return
+        elapsed_min = max((time.time() - t_start) / 60.0, 1e-9)
+        rpm = results_received / elapsed_min
+        remaining = max((pbar.total or expected_total) - pbar.n, 0)
+        eta_min = remaining / rpm if rpm > 0 else 0.0
+        pbar.set_postfix(
+            ok=len(all_records),
+            failed=len(all_failures),
+            rpm=f"{rpm:.1f}",
+            eta=f"{eta_min:.1f}min",
+            refresh=False,
+        )
+        pbar.update(1)
 
     while True:
         if not args.skip_preprocess:
             bridge_produced()
+            if pbar is not None and pp_done and not pbar_total_adjusted:
+                # Preprocessing revealed how many clips were skipped-existing;
+                # shrink the bar so it actually reaches 100%.
+                if api_fed != pbar.total:
+                    pbar.total = max(api_fed, pbar.n)
+                    pbar.refresh()
+                pbar_total_adjusted = True
         now = time.time()
-        if now - last_progress_t >= PROGRESS_INTERVAL_S and expected_total > 0:
+        if pbar is None and now - last_progress_t >= PROGRESS_INTERVAL_S and expected_total > 0:
             elapsed = now - t_start
             rate = results_received / max(elapsed / 60, 1e-9)
             eta_min = (expected_total - results_received) / rate if rate > 0 else float("inf")
@@ -1322,7 +1404,8 @@ def main():
                 break
         all_failures.extend(res.failures)
         writer.submit(res)
-        if pp_done and results_received >= expected_total:
+        _update_pbar()
+        if pp_done and results_received >= api_fed:
             break
 
     for _ in range(args.api_workers):
@@ -1331,6 +1414,8 @@ def main():
         t.join(timeout=5)
     for t in pp_threads:
         t.join(timeout=5)
+    if pbar is not None:
+        pbar.close()
     writer.close()
     elapsed = time.time() - t_start
 
@@ -1359,6 +1444,7 @@ def main():
         "n_empty": outcome_counts[OUTCOME_EMPTY],
         "n_fallback_sectioned": outcome_counts["fallback_sectioned"],
         "n_recovery_10s": outcome_counts["10s_slices"],
+        "n_first_attempt_rejection": outcome_counts["first_attempt_rejection"],
         "elapsed_s": round(elapsed, 2),
         "effective_rpm": round(results_received / max(elapsed / 60, 1e-9), 2),
         "tokens": {"total_in": total_in, "total_out": total_out, "total_cached": total_cached},
@@ -1375,6 +1461,7 @@ def main():
 
     unique = len(set(c.narrative for c in all_records)) if all_records else 0
     log.info(f"done. ok={n_ok} failed={len(all_failures)} skipped={skipped_existing} "
+             f"first_rejection={outcome_counts['first_attempt_rejection']} "
              f"safety={outcome_counts[OUTCOME_SAFETY]} parse_failed={outcome_counts[OUTCOME_PARSE_FAILED]} "
              f"empty={outcome_counts[OUTCOME_EMPTY]} recovered_10s={outcome_counts['10s_slices']}")
     log.info(f"  elapsed={elapsed:.1f}s ({elapsed/60:.1f}min)  "
