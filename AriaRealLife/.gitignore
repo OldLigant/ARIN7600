@@ -1,0 +1,28 @@
+# --- Secrets ---
+.env
+
+# --- Raw sample data (large, not for git) ---
+test/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Caption pipeline intermediate/cache outputs ---
+# Keep only the main annotation jsonl; drop usage logs, run logs, summaries,
+# the re-encoded image/audio slice cache, probe/verification test outputs,
+# and archived older runs.
+captions/**/_cache/
+captions/**/_test/
+captions/**/_archive_*/
+captions/**/*_usage.jsonl
+captions/**/*_summary.json
+captions/**/*_run.log
+captions/**/*.log
+
+# --- OS/editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
