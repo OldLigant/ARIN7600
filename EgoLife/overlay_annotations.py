@@ -60,27 +60,40 @@ CRF = 23  # slightly higher quality than pipeline's 28 since text must stay cris
 # Clip id / time parsing
 # ===========================================================================
 
-def parse_clip_id(clip_id: str) -> tuple[int, str, int, int, int, int]:
-    """`DAY1_A1_JAKE_11094208` -> (day=1, participant='A1_JAKE', hh, mm, ss, cs).
+def parse_clip_id(clip_id: str) -> tuple[int, str, int, int, int, int, int]:
+    """`DAY1_A1_JAKE_11094208` -> (day=1, participant='A1_JAKE', hh, mm, ss, cs, piece_idx).
 
-    The trailing 8 digits are HH MM SS CC (centiseconds). Returns them unpacked."""
+    The trailing 8 digits are HH MM SS CC (centiseconds). For clips produced by the
+    sub-30s splitter, an optional `_p{N}` suffix follows the timestamp
+    (e.g. `DAY4_A1_JAKE_10483000_p2` is the 2nd piece of source 10483000). piece_idx
+    is 0 for whole (un-split) clips, or N for `_p{N}`."""
     parts = clip_id.split("_")
-    # DAY1_A1_JAKE_11094208  ->  ['DAY1', 'A1', 'JAKE', '11094208']
+    # DAY1_A1_JAKE_11094208      ->  ['DAY1', 'A1', 'JAKE', '11094208']
+    # DAY4_A1_JAKE_10483000_p2   ->  ['DAY4', 'A1', 'JAKE', '10483000', 'p2']
     if len(parts) < 4:
         raise ValueError(f"unexpected clip_id format: {clip_id}")
     day = int(parts[0].removeprefix("DAY"))
+    # Pop a trailing _p{N} piece suffix if present.
+    piece_idx = 0
+    if re.fullmatch(r"p\d+", parts[-1]):
+        piece_idx = int(parts.pop()[1:])
     participant = "_".join(parts[1:-1])
     ts = parts[-1]
     if len(ts) != 8 or not ts.isdigit():
         raise ValueError(f"clip_id timestamp not 8 digits: {clip_id}")
     hh, mm, ss, cs = int(ts[0:2]), int(ts[2:4]), int(ts[4:6]), int(ts[6:8])
-    return day, participant, hh, mm, ss, cs
+    return day, participant, hh, mm, ss, cs, piece_idx
 
 
-def clip_start_seconds(clip_id: str) -> float:
-    """Absolute wall-clock seconds of the clip's first frame (from the filename ts)."""
-    _, _, hh, mm, ss, cs = parse_clip_id(clip_id)
-    return hh * 3600 + mm * 60 + ss + cs / 100.0
+def clip_start_seconds(clip_id: str, piece_offset_s: float = 0.0) -> float:
+    """Absolute wall-clock seconds of the clip's first frame.
+
+    For a split piece (`_p{N}`), the source timestamp names the SOURCE clip's start,
+    not the piece's start — so callers must pass `piece_offset_s` = (piece_idx-1) *
+    per-piece duration, which main() computes from the slice's ffprobe duration and
+    the total source duration (or accepts an explicit --piece-offset)."""
+    _, _, hh, mm, ss, cs, _ = parse_clip_id(clip_id)
+    return hh * 3600 + mm * 60 + ss + cs / 100.0 + piece_offset_s
 
 
 # ===========================================================================
@@ -325,10 +338,15 @@ def main():
     ap.add_argument("--participant", default=None, help="override participant (default: from clip-id)")
     ap.add_argument("--day", type=int, default=None, help="override day (default: from clip-id)")
     ap.add_argument("--font", default=DEFAULT_FONT)
+    ap.add_argument("--piece-offset", type=float, default=None,
+                    help="for split pieces (_p{N}): seconds the piece starts into its "
+                         "source clip, i.e. (piece_idx-1) * per-piece duration. Auto-"
+                         "computed from piece_idx and slice duration if omitted; override "
+                         "for non-even splits or to use the exact source-derived offset.")
     ap.add_argument("--out", type=Path, required=True, help="output mp4 path")
     args = ap.parse_args()
 
-    day, participant, hh, mm, ss, cs = parse_clip_id(args.clip_id)
+    day, participant, hh, mm, ss, cs, piece_idx = parse_clip_id(args.clip_id)
     day = args.day or day
     participant = args.participant or participant
 
@@ -346,7 +364,14 @@ def main():
         sys.exit(f"slice not found: {args.slice_path}")
     duration = ffprobe_duration(args.slice_path)
 
-    clip_start = clip_start_seconds(args.clip_id)
+    # For split pieces (_p{N}), the clip_id's timestamp is the SOURCE's start; the
+    # piece itself starts (piece_idx-1) slices later. Auto-compute as
+    # (piece_idx-1) * this_slice_duration, which is exact for even splits.
+    if piece_idx > 0:
+        piece_offset = args.piece_offset if args.piece_offset is not None else (piece_idx - 1) * duration
+    else:
+        piece_offset = 0.0
+    clip_start = clip_start_seconds(args.clip_id, piece_offset_s=piece_offset)
     clip_end = clip_start + duration
 
     caption = load_caption(args.jsonl, args.clip_id)
