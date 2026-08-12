@@ -22,6 +22,11 @@ captions/**/*_summary.json
 captions/**/*_run.log
 captions/**/*.log
 
+# --- Test / scratch output (never commit experiments) ---
+captions/**/_test/
+captions/**/_archive_*/
+out/_test/
+
 # --- OS/editor ---
 .DS_Store
 Thumbs.db

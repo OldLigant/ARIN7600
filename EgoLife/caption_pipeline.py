@@ -1,8 +1,13 @@
 """caption_pipeline.py — self-contained Mimo captioning pipeline for EgoLife.
 
-Turns 30-second first-person (Meta Aria) video segments into 5-layer structured
-JSON annotations: self_actions / others / environment / speech / psychology
-(with an `awareness` field scoring how strongly emotion drove behavior).
+Turns first-person (Meta Aria) video segments into 5-layer (+optional OCR)
+structured JSON annotations: self_actions / others / environment / speech /
+psychology (with an `awareness` field scoring how strongly emotion drove behavior).
+
+By default each ~30s source file is split into 3 x ~10s pieces and each piece is
+captioned independently (finer granularity, lower per-call rejection rate). Use
+--clip-duration to choose a different split target (5/6/10/15/30); 30 disables
+splitting (one caption per source file, the legacy behaviour).
 
 Single file, no sibling-module imports. Depends only on the OpenAI SDK,
 pandas, python-dotenv, jsonschema, and ffmpeg/ffprobe on PATH.
@@ -10,13 +15,15 @@ pandas, python-dotenv, jsonschema, and ffmpeg/ffprobe on PATH.
 Architecture
 ------------
   [PreprocessWorker pool]   [RateLimiter]   [API Worker pool]   [Writer]
-  ffmpeg re-encode   ->   produced_q   ->  acquire()  ->  Mimo call  ->  result_q  ->  ordered jsonl
-   (CPU/subprocess)         (bounded)     (global, RPM cap)       (IO)                (single thread)
+  ffmpeg split/re-encode ->  produced_q  ->  acquire()  ->  Mimo call  ->  result_q  ->  ordered jsonl
+   (CPU/subprocess)          (bounded)      (global, RPM cap)       (IO)                (single thread)
 
 Usage
 -----
-  # standard run: 30s clips, JSON output, no thinking
+  # standard run: 10s pieces (default), JSON output, no thinking
   python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
+  # legacy: one caption per 30s source file (no splitting)
+  python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
   # time-windowed
   python caption_pipeline.py --start-time 1110 --end-time 1130
   # resume after an interruption (skips clips already in the output file)
@@ -34,6 +41,7 @@ import collections
 import heapq
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -105,18 +113,21 @@ Use exactly this structure (fill every field; use empty arrays/strings when a se
     {"lang": "zh", "speaker": "...", "text": "..."}
   ],
   "psychology": {"awareness": "low", "emotion": "...", "note": "..."},
+  "ocr": [{"where": "whiteboard", "text": "...", "note": "..."}],
   "tags": ["..."]
 }
 
 ## Field rules
 
-self_actions: 3-6 objects, one per self-action, in first person ("I"), present tense, verb-led.
-Cover the whole clip span. Each "time"/"time_end" is a watermark-based HH:MM:SS (~5s resolution).
+self_actions: one object per discrete self-action, in first person ("I"), present tense, verb-led.
+Cover the whole clip span. Each "time"/"time_end" is a watermark-based HH:MM:SS (~2-5s resolution).
 Describe hand-object contact, posture, gaze, locomotion, device use. Mirror these real examples:
 {"time":"11:10:02","time_end":"11:10:08","text":"我拿起手机划开屏幕"} /
 {"time":"11:10:22","time_end":"11:10:30","text":"我把手机传给一位穿着黄色上衣的女士"}.
-Use Chinese when the scene is Chinese-speaking. Never invent names for yourself; use neutral
-descriptors for others unless their name is shown or spoken.
+The user message gives a SUGGESTED action count for this clip's duration — treat it as guidance,
+not a quota: if the scene is genuinely low-action (sitting, waiting, one long task), fewer actions
+is correct; do not pad or invent. Use Chinese when the scene is Chinese-speaking. Never invent names
+for yourself; use neutral descriptors for others unless their name is shown or spoken.
 
 others: zero or more objects, same shape, timestamped the same way. Lead text with the person
 descriptor ("a woman in blue", "Shure"). Empty array if you are alone.
@@ -127,6 +138,13 @@ screen content, object layout, weather/outdoor cues, location transitions. Empty
 speech: zero or more objects. lang in {"zh","en"}; speaker optional; text is the quoted utterance.
 Transcribe only what is actually heard; do not invent. Speech has no reliable timestamp from the
 watermark, so do NOT timestamp it. Empty array if silent.
+
+ocr: OPTIONAL. Include ONLY when there is substantial readable text on a surface in the clip —
+paper, a whiteboard/blackboard, a phone/laptop screen, a sign/poster, packaging, etc. Each entry:
+{"where": "whiteboard|paper|screen|sign|other", "text": "<legible content, verbatim if possible>",
+"note": "<optional, e.g. 'handwriting unclear' or 'partially off-screen'>"}. Transcribe what is
+actually legible; do not invent. Do NOT OCR the top-right time watermark. Empty array [] if no
+notable text surface appears.
 
 psychology: an object with exactly:
   awareness: "low" | "medium" | "high"  (required)
@@ -155,8 +173,27 @@ USER_TASK_TMPL = (
     "Annotate this {duration_desc} first-person video ({clip_id}) and return the JSON object.\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
     "Read the top-right watermark (HH:MM:SS:FF {day_label}) to timestamp the self_actions and others. "
-    "Cover the full segment from {start_hms} onward."
+    "Cover the full segment from {start_hms} onward.\n"
+    "Suggested self_actions count for this ~{target_s}s clip: {n_min}-{n_max} "
+    "(guidance only — fewer is fine when the scene is genuinely low-action)."
 )
+
+# Suggested self_actions count by clip-duration target. Passed into the user message as
+# GUIDANCE ONLY — the model is explicitly told fewer is fine for low-action scenes.
+ACTION_COUNT_GUIDE = {30: (4, 8), 15: (3, 6), 10: (3, 6), 6: (2, 4), 5: (2, 4)}
+
+
+def suggested_action_count(target_s: int) -> tuple[int, int]:
+    """Look up the (min, max) suggested self_actions count for a clip-duration target.
+    Falls back to the nearest shorter target if an unknown value slips through."""
+    if target_s in ACTION_COUNT_GUIDE:
+        return ACTION_COUNT_GUIDE[target_s]
+    # nearest-key fallback (defensive; CLI choices are all in the table)
+    keys = sorted(ACTION_COUNT_GUIDE, reverse=True)
+    for k in keys:
+        if target_s >= k:
+            return ACTION_COUNT_GUIDE[k]
+    return ACTION_COUNT_GUIDE[keys[-1]]
 
 
 # ===========================================================================
@@ -196,33 +233,10 @@ def parse_ts(filename: str) -> str:
     return f"{hh}:{mm}:{ss}.{cc}"
 
 
-def concat_two_clips(src_a: Path, src_b: Path, out: Path, clip_id: str) -> None:
-    """Concat two already-re-encoded clips into one 60s clip (ffmpeg concat demuxer,
-    stream-copy). Only used when --clip-duration 60."""
-    out.parent.mkdir(parents=True, exist_ok=True)
-    list_path = (out.parent / f"{clip_id}_concat.txt").resolve()
-    try:
-        list_path.write_text(
-            f"file '{src_a.resolve().as_posix()}'\nfile '{src_b.resolve().as_posix()}'\n",
-            encoding="utf-8",
-        )
-        rc = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-             "-i", str(list_path), "-c", "copy", "-movflags", "+faststart", str(out.resolve())],
-            capture_output=True, text=True,
-        )
-        if rc.returncode != 0:
-            raise RuntimeError(f"ffmpeg concat failed: {rc.stderr.strip()[:300]}")
-    finally:
-        try:
-            list_path.unlink()
-        except OSError:
-            pass
-
-
 def slice_to_10s(src_video: Path, clip_id: str, out_dir: Path) -> list[Path]:
-    """Recovery: slice a rejected clip into up to 3 x ~10s pieces (re-encoded for
-    accurate cuts). Each piece is then captioned on its own."""
+    """Recovery-only: slice a rejected ~30s clip into up to 3 x ~10s pieces
+    (re-encoded for accurate cuts). Each piece is then captioned on its own.
+    Only invoked when --clip-duration 30; first-class 10s mode never reaches here."""
     dur = ffprobe_duration(src_video)
     n_slices = max(1, int(dur // 10) + (1 if dur % 10 > 1 else 0))
     n_slices = min(n_slices, 3)
@@ -243,6 +257,95 @@ def slice_to_10s(src_video: Path, clip_id: str, out_dir: Path) -> list[Path]:
     return paths
 
 
+@dataclass
+class SliceInfo:
+    """One output piece from splitting a source file. For target_s that divides the
+    source evenly (e.g. 30s→3×10s), every piece has the same duration. The last piece
+    of an irregular clip (e.g. 22s→3×7.33s) carries any remainder implicitly via the
+    even division. start_hms is the watermark-derived HH:MM:SS at the piece start."""
+    path: Path
+    duration: float
+    piece_idx: int        # 1-based
+    start_hms: str        # "HH:MM:SS"
+    is_whole: bool        # True when n==1 (no splitting happened)
+
+
+def _add_seconds_to_hms(hms: str, seconds: float) -> str:
+    """Add `seconds` to a "HH:MM:SS" watermark timestamp, rolling over minutes/hours.
+    Used to compute each slice's watermark start from the source clip's start."""
+    hh, mm, ss = (int(x) for x in hms.split(":"))
+    total = hh * 3600 + mm * 60 + ss + seconds
+    total = total % 86400  # wrap at midnight (DAY boundary unlikely within a 30s clip)
+    hh2 = int(total // 3600)
+    mm2 = int((total % 3600) // 60)
+    ss2 = total % 60
+    return f"{hh2:02d}:{mm2:02d}:{int(ss2):02d}"
+
+
+def _n_pieces_for_duration(dur: float, target_s: int) -> int:
+    """How many pieces to split a clip of `dur` seconds into, targeting `target_s` each.
+
+    Rule (matches the user's spec): anything strictly longer than the target gets split.
+    A 30.04s source at target=10 yields 3 pieces (not 4) — the extra 0.04s is just encoder
+    padding. So: 8s→1, 10s→1, 11s→2, 15s→2, 22s→3, 30s→3 (at target=10).
+
+    Implementation: clamp the effective duration to an exact multiple when within 0.5s of
+    one (kills the 30.04→4 problem), then ceil so anything over a boundary rounds UP.
+    """
+    # Snap dur to the nearest exact multiple of target_s when within 0.5s (encoder padding).
+    snapped = round(dur / target_s) * target_s
+    if abs(snapped - dur) <= 0.5:
+        dur = float(snapped)
+    if dur <= target_s:
+        return 1
+    return max(2, math.ceil(dur / target_s - 1e-9))
+
+
+def split_source_into_slices(src: Path, clip_id: str, base_hms: str, target_s: int,
+                             out_dir: Path, *, resolution: int, fps: int, crf: int,
+                             audio_k: int, skip_if_exists: bool = True) -> list[SliceInfo]:
+    """Re-encode `src` into ceil(dur/target_s) evenly-sized pieces.
+
+    - target_s=30 (or any target >= dur): one whole-clip re-encode, kind stays 30s/segment_open.
+    - target_s=10, dur=30: 3 pieces of ~10s each, kind "10s".
+    - dur=22, target_s=10: 3 pieces of ~7.33s (ceil(22/10)=3, evenly divided).
+    - dur=8,  target_s=10: 1 piece (whole clip, not split — 8s ≤ target).
+
+    Uses accurate seek (-ss after -i, -t) since we re-encode anyway; cuts are frame-accurate.
+    Returns one SliceInfo per piece, in playback order.
+    """
+    dur = ffprobe_duration(src)
+    n = _n_pieces_for_duration(dur, target_s)
+    slice_dur = dur / n
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pieces: list[SliceInfo] = []
+    for i in range(n):
+        start_off = i * slice_dur
+        is_whole = (n == 1)
+        suffix = "" if is_whole else f"_p{i + 1}"
+        out_path = out_dir / f"{clip_id}{suffix}.mp4"
+        if skip_if_exists and out_path.exists() and out_path.stat().st_size > 0:
+            pass  # keep existing encode
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(src), "-ss", f"{start_off:.3f}", "-t", f"{slice_dur:.3f}",
+                "-vf", f"fps={fps},scale={resolution}:{resolution}:flags=lanczos",
+                "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+                "-c:a", "aac", "-b:a", f"{audio_k}k", "-ac", "1",
+                "-movflags", "+faststart", str(out_path),
+            ]
+            rc = subprocess.run(cmd, capture_output=True, text=True)
+            if rc.returncode != 0:
+                raise RuntimeError(f"ffmpeg slice failed: {rc.stderr.strip()[:300]}")
+        actual_dur = ffprobe_duration(out_path)
+        pieces.append(SliceInfo(
+            path=out_path, duration=actual_dur, piece_idx=i + 1,
+            start_hms=_add_seconds_to_hms(base_hms, start_off), is_whole=is_whole,
+        ))
+    return pieces
+
+
 # ===========================================================================
 # JSON parsing & output classification
 # ===========================================================================
@@ -251,7 +354,7 @@ _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 _TAGS_RE = re.compile(r"^Tags:\s*(.+)$", re.MULTILINE)
 _TS_RANGE_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})(?:\s*-\s*(\d{2}:\d{2}:\d{2}))?\s*(.*)$")
 _SPEECH_RE = re.compile(r"^\[(zh|en|other)\]\s*(.*)$", re.IGNORECASE)
-_SECTION_HEADERS = ("Self", "Others", "Environment", "Speech", "Psychology", "Tags")
+_SECTION_HEADERS = ("Self", "Others", "Environment", "Speech", "Psychology", "Ocr", "Tags")
 _QUOTE_PAIRS = str.maketrans({"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"})
 
 _ANNOTATION_SCHEMA = {
@@ -270,6 +373,7 @@ _ANNOTATION_SCHEMA = {
             },
             "required": ["awareness", "emotion"],
         },
+        "ocr": {"type": "array", "items": {"type": "object"}},
         "tags": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["self_actions", "psychology", "tags"],
@@ -365,6 +469,32 @@ def _parse_psychology(lines: list) -> dict:
     return psych
 
 
+_OCR_WHERE_TOKENS = ("whiteboard", "paper", "screen", "sign", "other", "blackboard",
+                     "monitor", "laptop", "phone", "poster", "book", "label", "package")
+
+
+def _parse_ocr(lines: list) -> list:
+    """Parse an [Ocr] fallback section. Each line may be:
+      - `where: "text"` (e.g. `whiteboard: "会议安排"`)
+      - `where - text` / `where | text`
+      - bare text (where defaults to "")
+    """
+    out = []
+    for ln in lines:
+        ln = _strip_bullet(ln).translate(_QUOTE_PAIRS)
+        if not ln:
+            continue
+        where, text = "", ln
+        m = re.match(r"^([A-Za-z]+)\s*[:\-|]\s*(.+)$", ln)
+        if m and m.group(1).lower() in _OCR_WHERE_TOKENS:
+            where = m.group(1).lower()
+            text = m.group(2).strip().strip('"').strip()
+        else:
+            text = ln.strip().strip('"').strip()
+        out.append({"where": where, "text": text, "note": ""})
+    return out
+
+
 def parse_layered_caption(text: str) -> dict:
     """Fallback parser for sectioned text (used if the model ignores json_object
     mode and emits [Self]/[Psychology] style output). Returns the same dict shape
@@ -386,6 +516,7 @@ def parse_layered_caption(text: str) -> dict:
         "environment": " ".join(sections.get("Environment", [])).strip(),
         "speech": _parse_speech(sections.get("Speech", [])),
         "psychology": _parse_psychology(sections.get("Psychology", [])),
+        "ocr": _parse_ocr(sections.get("Ocr", [])),
         "tags": tags,
     }
 
@@ -429,6 +560,12 @@ def parse_json_caption(content: str) -> dict:
         return {"lang": str(s.get("lang", "") or ""), "speaker": str(s.get("speaker", "") or ""),
                 "text": str(s.get("text", "") or "")}
 
+    def _norm_ocr(o):
+        if not isinstance(o, dict):
+            return {"where": "", "text": str(o), "note": ""}
+        return {"where": str(o.get("where", "") or ""), "text": str(o.get("text", "") or ""),
+                "note": str(o.get("note", "") or "")}
+
     psych = data.get("psychology") or {}
     return {
         "self_actions": [_norm_action(a) for a in data.get("self_actions", [])],
@@ -438,6 +575,7 @@ def parse_json_caption(content: str) -> dict:
         "psychology": {"awareness": str(psych.get("awareness", "") or ""),
                        "emotion": str(psych.get("emotion", "") or ""),
                        "note": str(psych.get("note", "") or "")},
+        "ocr": [_norm_ocr(o) for o in data.get("ocr", [])],
         "tags": [str(t) for t in data.get("tags", [])],
     }
 
@@ -485,7 +623,8 @@ class CaptionRecord:
     environment: str = ""
     speech: list = None          # [{lang, speaker, text}]
     psychology: dict = None      # {awareness, emotion, note}
-    clip_kind: str = "30s"       # "30s" | "60s" | "segment_open" | "10s"
+    ocr: list = None             # [{where, text, note}]  (optional layer; empty if no text surface)
+    clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
     output_format: str = "json"  # "json" | "fallback_sectioned"
     recovery: str = ""           # "ok" | "fallback_sectioned" | "10s_slices"
 
@@ -513,17 +652,21 @@ def make_user_message(video_path: Path, clip_row: pd.Series, is_10s: bool = Fals
     src = clip_row["src_file"]
     ts_raw = Path(src).stem.split("_")[-1]
     day_label = f"DAY{int(clip_row['day'])}"
-    start_hms = f"{ts_raw[0:2]}:{ts_raw[2:4]}:{ts_raw[4:6]}"
+    # start_hms comes from the row when available (slice-aware), else from the source filename.
+    start_hms = clip_row.get("start_hms") or f"{ts_raw[0:2]}:{ts_raw[2:4]}:{ts_raw[4:6]}"
     clip_kind = clip_row.get("clip_kind", "30s")
+    target_s = int(clip_row.get("target_s", 30))
+    # Duration descriptor: "~Ns-second" using the actual target (10/15/30/5/6).
+    # is_10s (recovery slice) overrides to the legacy "10-second" wording for back-compat.
     if is_10s:
         duration_desc = "10-second"
-    elif clip_kind == "60s":
-        duration_desc = "~60-second"
     else:
-        duration_desc = "~30-second"
+        duration_desc = f"~{target_s}-second"
+    n_min, n_max = suggested_action_count(target_s if not is_10s else 10)
     task = USER_TASK_TMPL.format(
         clip_id=clip_row["clip_id"], src_file=src, day_label=day_label,
         start_hms=start_hms, duration_desc=duration_desc,
+        target_s=(10 if is_10s else target_s), n_min=n_min, n_max=n_max,
     )
     return {"role": "user", "content": [
         {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64_video(video_path)}"}, "fps": 2},
@@ -581,7 +724,7 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         model=model, ts_captioned=ts, slice_path=clip_row["slice_path"],
         tokens={"in": usage["prompt_tokens"], "out": usage["completion_tokens"], "cached": usage["cached_tokens"]},
         self_actions=layered["self_actions"], others=layered["others"], environment=layered["environment"],
-        speech=layered["speech"], psychology=layered["psychology"],
+        speech=layered["speech"], psychology=layered["psychology"], ocr=layered["ocr"],
         clip_kind=clip_row.get("clip_kind", "30s"), output_format=output_format, recovery=recovery,
     )
     use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), recovery, usage)
@@ -615,7 +758,7 @@ class SlidingWindowRateLimiter:
 
 
 # ===========================================================================
-# Source selection & 60s pairing
+# Source selection & clip grouping
 # ===========================================================================
 
 def _fname_to_seconds(name: str) -> float:
@@ -672,40 +815,46 @@ def select_source_files(src_root, participant, day, start_time, end_time):
 
 
 class ClipUnit:
-    """A preprocess unit: single source (30s/segment_open) or a 60s pair."""
-    __slots__ = ("kind", "srcs", "clip_id", "start_ts")
+    """A preprocess unit: one source file, to be split into ceil(dur/target_s) pieces.
+    The 60s-merge mode has been removed; every unit is single-source."""
+    __slots__ = ("kind", "srcs", "clip_id", "start_ts", "target_s")
 
-    def __init__(self, kind, srcs, clip_id, start_ts):
-        self.kind = kind        # "30s" | "60s" | "segment_open"
-        self.srcs = srcs
+    def __init__(self, kind, srcs, clip_id, start_ts, target_s):
+        self.kind = kind        # "30s" | "segment_open"  (pre-split; pieces get "10s"/"15s"/etc.)
+        self.srcs = srcs        # always len==1 now
         self.clip_id = clip_id
         self.start_ts = start_ts
+        self.target_s = target_s
 
 
-def pair_into_minutes(files, breaks, participant, day, clip_duration):
-    """Group source files into ClipUnits. clip_duration=60 pairs consecutive
-    :00+:30 files of the same minute (never across a recording break)."""
-    break_set = set(breaks)
+def group_into_clips(files, participant, day, target_s):
+    """Group source files into single-source ClipUnits. No merging (60s mode removed).
+    Each unit carries target_s so _preprocess_worker knows how many pieces to slice into."""
     units = []
-    i, n = 0, len(files)
-    while i < n:
-        f = files[i]
+    for i, f in enumerate(files):
         ts_raw = Path(f.stem).stem.split("_")[-1]
         ss_field = ts_raw[4:6]
-        is_segment_open = ss_field not in ("00", "30")
-        if (clip_duration == 60 and ss_field == "00" and (i + 1) < n
-                and (i + 1) not in break_set):
-            nxt = files[i + 1]
-            nxt_ts = Path(nxt.stem).stem.split("_")[-1]
-            if nxt_ts[0:4] == ts_raw[0:4] and nxt_ts[4:6] == "30":
-                clip_id = f"DAY{day}_{participant}_{ts_raw[0:6]}_60s"
-                units.append(ClipUnit("60s", [f, nxt], clip_id, _ts_label(f.name)))
-                i += 2
-                continue
-        kind = "segment_open" if is_segment_open else "30s"
-        units.append(ClipUnit(kind, [f], f"DAY{day}_{participant}_{ts_raw}", _ts_label(f.name)))
-        i += 1
+        kind = "segment_open" if ss_field not in ("00", "30") else "30s"
+        units.append(ClipUnit(kind, [f], f"DAY{day}_{participant}_{ts_raw}",
+                              _ts_label(f.name), target_s))
     return units
+
+
+def count_pieces_for_units(units, log=None) -> list[int]:
+    """Pre-scan durations via ffprobe to compute how many output pieces each unit yields.
+    Returns a parallel list; sum of it = expected_total.
+    One ffprobe per source (~tens of ms); acceptable even for ~1000 files."""
+    out = []
+    for u in units:
+        try:
+            dur = ffprobe_duration(u.srcs[0])
+            n = _n_pieces_for_duration(dur, u.target_s)
+        except Exception as e:
+            if log:
+                log.warning(f"[count] ffprobe failed for {u.srcs[0].name}: {e}; assuming 1 piece")
+            n = 1
+        out.append(n)
+    return out
 
 
 # ===========================================================================
@@ -722,13 +871,14 @@ class ApiCallConfig:
 
 
 class PreprocessJob:
-    __slots__ = ("unit", "idx", "day", "user", "skip_if_exists", "resolution",
-                 "fps", "crf", "audio_k", "slices_dir", "out_dir")
+    __slots__ = ("unit", "idx_base", "is_first_unit", "day", "user", "skip_if_exists",
+                 "resolution", "fps", "crf", "audio_k", "slices_dir", "out_dir")
 
-    def __init__(self, unit, idx, *, day, user, skip_if_exists, resolution, fps, crf, audio_k,
-                 slices_dir, out_dir):
+    def __init__(self, unit, idx_base, *, is_first_unit, day, user, skip_if_exists,
+                 resolution, fps, crf, audio_k, slices_dir, out_dir):
         self.unit = unit
-        self.idx = idx
+        self.idx_base = idx_base        # global_idx of this unit's FIRST piece (1-based)
+        self.is_first_unit = is_first_unit
         self.day = day
         self.user = user
         self.skip_if_exists = skip_if_exists
@@ -758,54 +908,42 @@ def _preprocess_worker(job_q, out_q, log):
             job_q.task_done()
             return
         unit = job.unit
-        clip_id = unit.clip_id
+        base_clip_id = unit.clip_id
+        src = unit.srcs[0]
         try:
-            slice_path = job.slices_dir / f"{clip_id}.mp4"
-            if unit.kind == "60s":
-                if job.skip_if_exists and slice_path.exists() and slice_path.stat().st_size > 0:
-                    log.debug(f"[preprocess] {clip_id} merged slice exists, skipping")
-                else:
-                    halves = []
-                    for k, src in enumerate(unit.srcs):
-                        h = job.slices_dir / f"{clip_id}_half{k + 1}.mp4"
-                        if not (job.skip_if_exists and h.exists() and h.stat().st_size > 0):
-                            ffmpeg_reencode(src, h, resolution=job.resolution, fps=job.fps,
-                                            crf=job.crf, audio_k=job.audio_k)
-                        halves.append(h)
-                    concat_two_clips(halves[0], halves[1], slice_path, clip_id)
-                duration = ffprobe_duration(slice_path)
-                ts = unit.start_ts
+            # Split (or whole-encode) the source into ceil(dur/target_s) pieces.
+            # split_source_into_slices re-encodes each piece at the configured quality.
+            pieces = split_source_into_slices(
+                src, base_clip_id, unit.start_ts, unit.target_s, job.slices_dir,
+                resolution=job.resolution, fps=job.fps, crf=job.crf, audio_k=job.audio_k,
+                skip_if_exists=job.skip_if_exists,
+            )
+            # If only one piece came back (short clip or target_s>=dur), keep the
+            # unit's original kind (30s / segment_open); otherwise mark pieces as
+            # "{target_s}s" so the prompt and recovery path know the granularity.
+            for piece in pieces:
+                clip_kind = unit.kind if piece.is_whole else f"{unit.target_s}s"
+                piece_clip_id = base_clip_id if piece.is_whole else f"{base_clip_id}_p{piece.piece_idx}"
+                gid = job.idx_base + piece.piece_idx - 1
+                is_day_open = job.is_first_unit and piece.piece_idx == 1 and unit.kind == "segment_open"
                 row = pd.Series({
-                    "clip_id": clip_id, "day": job.day, "user": job.user, "start_ts": ts,
-                    "end_ts": f"{ts}+{duration:.3f}s",
-                    "src_file": "+".join(Path(s).name for s in unit.srcs), "clip_idx": 1,
-                    "global_idx": job.idx + 1, "duration": round(duration, 3),
-                    "is_day_open": False, "is_day_close": False, "status": "pending",
-                    "slice_path": str(slice_path.relative_to(job.out_dir)), "clip_kind": "60s",
+                    "clip_id": piece_clip_id, "day": job.day, "user": job.user,
+                    "start_ts": piece.start_hms,
+                    "end_ts": f"{piece.start_hms}+{piece.duration:.3f}s",
+                    "src_file": src.name, "clip_idx": piece.piece_idx,
+                    "global_idx": gid, "duration": round(piece.duration, 3),
+                    "is_day_open": is_day_open, "is_day_close": False, "status": "pending",
+                    "slice_path": str(piece.path.relative_to(job.out_dir)),
+                    "clip_kind": clip_kind,
+                    "target_s": (30 if piece.is_whole else unit.target_s),
+                    "start_hms": piece.start_hms,
                 })
-            else:
-                src = unit.srcs[0]
-                if job.skip_if_exists and slice_path.exists() and slice_path.stat().st_size > 0:
-                    log.debug(f"[preprocess] {clip_id} slice exists, skipping encode")
-                else:
-                    ffmpeg_reencode(src, slice_path, resolution=job.resolution, fps=job.fps,
-                                    crf=job.crf, audio_k=job.audio_k)
-                duration = ffprobe_duration(slice_path)
-                ts_base = parse_ts(src.name)
-                is_open = (job.idx == 0) and (unit.kind == "segment_open")
-                row = pd.Series({
-                    "clip_id": clip_id, "day": job.day, "user": job.user, "start_ts": ts_base,
-                    "end_ts": f"{ts_base}+{duration:.3f}s", "src_file": src.name, "clip_idx": 1,
-                    "global_idx": job.idx + 1, "duration": round(duration, 3),
-                    "is_day_open": is_open, "is_day_close": False, "status": "pending",
-                    "slice_path": str(slice_path.relative_to(job.out_dir)), "clip_kind": unit.kind,
-                })
-            out_q.put(PreprocessResult(clip_id=clip_id, global_idx=job.idx + 1,
-                                       slice_path=slice_path, row=row))
+                out_q.put(PreprocessResult(clip_id=piece_clip_id, global_idx=gid,
+                                           slice_path=piece.path, row=row))
         except Exception as e:
-            log.error(f"[preprocess] {clip_id} failed: {type(e).__name__}: {e}")
-            out_q.put(PreprocessResult(clip_id=clip_id, global_idx=job.idx + 1,
-                                       slice_path=job.slices_dir / f"{clip_id}.mp4", row=None,
+            log.error(f"[preprocess] {base_clip_id} failed: {type(e).__name__}: {e}")
+            out_q.put(PreprocessResult(clip_id=base_clip_id, global_idx=job.idx_base,
+                                       slice_path=job.slices_dir / f"{base_clip_id}.mp4", row=None,
                                        error=f"{type(e).__name__}: {e}"))
         finally:
             job_q.task_done()
@@ -908,42 +1046,53 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
                 reason2 = use_rec2.recovery if use_rec2 is not None else "retry_failed"
                 if use_rec2 is not None:
                     usage_records.append(use_rec2)
-                log.warning(f"[{clip_id}] second attempt also failed ({reason2}); "
-                            f"falling back to ~10s slices")
-                try:
-                    slice_paths = slice_to_10s(slice_path, clip_id, tmp_10s_dir)
-                except Exception as e:
-                    log.error(f"[{clip_id}] 10s slicing failed: {e}")
-                    failures.append({"clip_id": clip_id, "global_idx": gid, "error": f"slice_failed: {e}",
-                                     "reason": reason2, "raw_content_preview": (content or "")[:200]})
-                    out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
-                                        usage_records=usage_records, failures=failures))
-                    in_q.task_done()
-                    continue
-                log.info(f"[{clip_id}] sliced into {len(slice_paths)} pieces; captioning each ~10s clip")
-                ten_s_ok = 0
-                for sp in slice_paths:
-                    sub_row = row.copy()
-                    sub_row["clip_id"] = f"{clip_id}_10s_{ten_s_ok + 1}"
-                    sub_row["duration"] = 10.0
+                # Sub-30 clips (first-class 10s/15s/5s/6s pieces) cannot be sliced
+                # further, so give up after the single retry. Only legacy 30s /
+                # segment_open clips (from --clip-duration 30) fall back to 10s slicing.
+                clip_kind = row.get("clip_kind", "30s")
+                if clip_kind not in ("30s", "segment_open"):
+                    log.warning(f"[{clip_id}] second attempt also failed ({reason2}); "
+                                f"giving up ({clip_kind} clip, no further slicing)")
+                    failures.append({"clip_id": clip_id, "global_idx": gid,
+                                     "error": "all_attempts_failed", "reason": reason2,
+                                     "raw_content_preview": (content or "")[:200]})
+                else:
+                    log.warning(f"[{clip_id}] second attempt also failed ({reason2}); "
+                                f"falling back to ~10s slices")
                     try:
-                        sub_cap, sub_use, _ = _process_one_clip_limited(
-                            client, model, sp, sub_row, True, log, limiter, cfg)
+                        slice_paths = slice_to_10s(slice_path, clip_id, tmp_10s_dir)
                     except Exception as e:
-                        log.warning(f"[{clip_id}] 10s slice {sp.name} failed: {type(e).__name__}: {e}")
+                        log.error(f"[{clip_id}] 10s slicing failed: {e}")
+                        failures.append({"clip_id": clip_id, "global_idx": gid, "error": f"slice_failed: {e}",
+                                         "reason": reason2, "raw_content_preview": (content or "")[:200]})
+                        out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
+                                            usage_records=usage_records, failures=failures))
+                        in_q.task_done()
                         continue
-                    if sub_cap is not None:
-                        sub_cap.recovery = "10s_slices"
-                        caption_records.append(sub_cap)
-                        usage_records.append(sub_use)
-                        ten_s_ok += 1
-                        log.info(f"[{clip_id}] 10s slice {sp.name} succeeded")
-                    else:
-                        log.warning(f"[{clip_id}] 10s slice {sp.name} rejected/parse-failed")
-                log.info(f"[{clip_id}] 10s fallback result: {ten_s_ok}/{len(slice_paths)} slices succeeded")
-                if ten_s_ok == 0:
-                    failures.append({"clip_id": clip_id, "global_idx": gid, "error": "all_attempts_failed",
-                                     "reason": reason2, "raw_content_preview": (content or "")[:200]})
+                    log.info(f"[{clip_id}] sliced into {len(slice_paths)} pieces; captioning each ~10s clip")
+                    ten_s_ok = 0
+                    for sp in slice_paths:
+                        sub_row = row.copy()
+                        sub_row["clip_id"] = f"{clip_id}_10s_{ten_s_ok + 1}"
+                        sub_row["duration"] = 10.0
+                        try:
+                            sub_cap, sub_use, _ = _process_one_clip_limited(
+                                client, model, sp, sub_row, True, log, limiter, cfg)
+                        except Exception as e:
+                            log.warning(f"[{clip_id}] 10s slice {sp.name} failed: {type(e).__name__}: {e}")
+                            continue
+                        if sub_cap is not None:
+                            sub_cap.recovery = "10s_slices"
+                            caption_records.append(sub_cap)
+                            usage_records.append(sub_use)
+                            ten_s_ok += 1
+                            log.info(f"[{clip_id}] 10s slice {sp.name} succeeded")
+                        else:
+                            log.warning(f"[{clip_id}] 10s slice {sp.name} rejected/parse-failed")
+                    log.info(f"[{clip_id}] 10s fallback result: {ten_s_ok}/{len(slice_paths)} slices succeeded")
+                    if ten_s_ok == 0:
+                        failures.append({"clip_id": clip_id, "global_idx": gid, "error": "all_attempts_failed",
+                                         "reason": reason2, "raw_content_preview": (content or "")[:200]})
             else:
                 caption_records.append(cap_rec)
                 if use_rec2 is not None:
@@ -1089,9 +1238,10 @@ def main():
     ap.add_argument("--day", type=int, default=1)
     ap.add_argument("--start-time", default=None, help="start HHMM inclusive, e.g. 1110")
     ap.add_argument("--end-time", default=None, help="end HHMM exclusive, e.g. 1130")
-    ap.add_argument("--clip-duration", type=int, default=30, choices=[30, 60],
-                    help="30 = per source file (recommended). 60 = merge pairs "
-                         "(WARNING: model under-covers 60s, often only the first ~6s).")
+    ap.add_argument("--clip-duration", type=int, default=10, choices=[5, 6, 10, 15, 30],
+                    help="split target in seconds. Each source file is sliced into "
+                         "ceil(dur/target) pieces (e.g. 30s->3x10s). Must divide 30 evenly. "
+                         "30 = no splitting (one caption per source file, legacy behaviour).")
     # --- Paths ---
     ap.add_argument("--src-dir", type=Path, default=None,
                     help="ROOT of the video tree (default: ./videos). Clips are read from "
@@ -1228,9 +1378,19 @@ def main():
             log.error(str(e))
             sys.exit(2)
         log.info(f"source: {len(files)} files, {len(breaks)} recording break(s)")
-        units = pair_into_minutes(files, breaks, args.participant, args.day, args.clip_duration)
-        n60 = sum(1 for u in units if u.kind == "60s")
-        log.info(f"units: {len(units)} ({n60} x 60s merged, {len(units) - n60} standalone) "
+        units = group_into_clips(files, args.participant, args.day, args.clip_duration)
+        # Pre-scan durations to compute how many pieces each unit yields; assign each
+        # unit a contiguous global_idx block so pieces come out in deterministic order.
+        piece_counts = count_pieces_for_units(units, log=log)
+        idx_bases = []
+        running = 1  # global_idx is 1-based
+        for n in piece_counts:
+            idx_bases.append(running)
+            running += n
+        expected_total_pre = sum(piece_counts)
+        n_split = sum(1 for u in units if u.target_s < 30)
+        log.info(f"units: {len(units)} source files -> {expected_total_pre} pieces "
+                 f"(target={args.clip_duration}s, {n_split} will be split) "
                  f"@ {args.resolution}x{args.resolution}/{args.fps}fps")
         clips_df = None
 
@@ -1283,12 +1443,22 @@ def main():
             t.start()
             pp_threads.append(t)
         units_to_enqueue = units[:args.limit] if args.limit else units
+        limit_n = args.limit if args.limit else len(units)
+        # Recompute piece counts / idx_bases over the (possibly limited) slice, so
+        # global_idx assignment stays contiguous and matches expected_total.
+        piece_counts_enq = piece_counts[:limit_n]
+        expected_total = sum(piece_counts_enq)
+        idx_bases_enq = []
+        _running = 1
+        for n in piece_counts_enq:
+            idx_bases_enq.append(_running)
+            _running += n
         for i, unit in enumerate(units_to_enqueue):
-            pp_job_q.put(PreprocessJob(unit=unit, idx=i, day=args.day, user=args.participant,
+            pp_job_q.put(PreprocessJob(unit=unit, idx_base=idx_bases_enq[i],
+                                       is_first_unit=(i == 0), day=args.day, user=args.participant,
                                        skip_if_exists=(not args.reset), resolution=args.resolution,
                                        fps=args.fps, crf=args.crf, audio_k=args.audio_k,
                                        slices_dir=slices_dir, out_dir=cache_dir))
-        expected_total = len(units_to_enqueue)
         for _ in range(args.preprocess_workers):
             pp_job_q.put(None)
         pp_done, pp_expected, api_fed = False, expected_total, 0
