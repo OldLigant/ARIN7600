@@ -7,7 +7,8 @@ env_changes (atomic state transitions, cause-attributed) / speech / psychology
 plus optional OCR. The schema encodes the causal loop a simulator needs:
 emotion drives actions, actions mutate the environment, the environment feeds
 back into both actions and emotion. `awareness` grades the emotion->action edge;
-`causal_links` records the observable directed edges explicitly.
+every `causal_links` edge carries a counterfactual `strength` (strong/moderate/weak)
+on the same ladder, so the causal graph is weighted, not just binary.
 
 By default each ~30s source file is split into 3 x ~10s pieces and each piece is
 captioned independently (finer granularity, lower per-call rejection rate). Use
@@ -127,7 +128,7 @@ Use exactly this structure (fill every field; use empty arrays/strings when a se
   ],
   "psychology": {"awareness": "low", "emotion": "...", "note": "..."},
   "causal_links": [
-    {"type": "env->action", "cause": "...", "effect": "..."}
+    {"type": "env->action", "cause": "...", "effect": "...", "strength": "strong"}
   ],
   "ocr": [{"where": "whiteboard", "text": "...", "note": "..."}],
   "tags": ["..."]
@@ -188,6 +189,10 @@ psychology: an object with exactly:
   medium = emotion colored HOW an action was performed (tone, pace, expression, vigor) but did not
            change its direction.
   high   = emotion directly triggered a behavior or a turn/pivot (e.g. embarrassment -> covering face).
+This is the SAME ladder as causal_links "strength" (low=weak, moderate=medium, high=strong):
+awareness must AGREE with any emotion->action causal_link you write (an edge graded "moderate"
+means awareness "medium"), and must be filled even when that edge is too weak to deserve its own
+causal_links entry (awareness "low" with no emotion->action edge is normal).
 "emotion" picks from: neutral calm relaxed bored focused amused happy excited surprised confused
 curious anxious nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
 When an environment event or another person is what moved your emotion, say so in "note" and also
@@ -195,19 +200,33 @@ record it as an "env->emotion" or "other->emotion" causal_link.
 
 causal_links: the directed causal edges you can observe or confidently infer WITHIN this clip.
 One object per edge: {"type": "...", "cause": "<short phrase, prefix with HH:MM:SS when clear>",
-"effect": "<short phrase, prefix with HH:MM:SS when clear>"}. Use EXACTLY these "type" strings:
+"effect": "<short phrase, prefix with HH:MM:SS when clear>", "strength": "strong|moderate|weak"}.
+Use EXACTLY these "type" strings:
   "env->action"     an environment event/state changed MY behavior (phone vibrates -> I pick it up).
   "env->emotion"    an environment event changed my emotion (loud noise -> startled/annoyed).
   "emotion->action" my emotion directly drove my behavior (bored -> I start scrolling my phone);
-                    complements psychology.awareness, which grades this same edge.
+                    must agree with psychology.awareness (same ladder, see psychology).
   "action->env"     my action changed the environment (I flip the switch -> lights turn on);
                     mirrors env_changes entries with cause "self".
   "other->action"   another person's action triggered my action (colleague waves me over -> I walk over).
   "other->env"      another person's action changed the environment (she opens the curtain -> room brightens).
   "other->emotion"  another person's action changed my emotion (guest laughs -> I relax).
+Every edge carries a REQUIRED "strength" grading how strongly the cause drove the effect,
+defined counterfactually:
+  strong  = trigger: without this cause the effect likely would NOT have happened, or would have
+            gone a different direction (phone vibrates -> I pick it up; I flip the switch ->
+            lights on).
+  moderate= shaper: the cause changed HOW/WHEN/how vigorously the effect happened, but the effect
+            would still have occurred (boredom speeds up my scrolling; his tone makes me answer
+            more carefully).
+  weak    = background: one contributory factor among several; the effect was mostly driven by
+            habit or task (mild tiredness -> I rub my eyes once).
+Physical edges (action->env, other->env) will almost always be "strong" — that is expected, not
+lazy. Grade honestly; do not pad the graph with weak background edges.
 Rules: the causal direction must be visible or strongly implied by temporal order and mechanism —
-never fabricate; when in doubt, omit the edge. 0-3 links is typical; empty array is fine. Quote the
-atomic action / change texts (with their times) rather than vague summaries.
+never fabricate; omit an edge only when you doubt it EXISTS (strength "weak" is the honest way to
+record a real but minor influence). 0-3 links is typical; empty array is fine. Quote the atomic
+action / change texts (with their times) rather than vague summaries.
 
 tags: 5-10 short lowercase keywords (objects, actions, location, people descriptors). MANDATORY,
 never empty.
@@ -229,7 +248,8 @@ USER_TASK_TMPL = (
     "Decompose what happens into ATOMIC actions and ATOMIC environment state changes — there is NO "
     "count quota; atomicity is the standard. Then record every causal edge you can defend from the "
     "clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
-    "other->env, other->emotion."
+    "other->env, other->emotion — each graded strength strong/moderate/weak by how strongly the "
+    "cause drove the effect."
 )
 
 
@@ -411,6 +431,8 @@ _ANNOTATION_SCHEMA = {
             },
             "required": ["awareness", "emotion"],
         },
+        # causal_links items are normalized leniently in _norm_causal (invalid/missing
+        # strength -> ""), so a stray value on one edge never rejects the whole response.
         "causal_links": {"type": "array", "items": {"type": "object"}},
         "ocr": {"type": "array", "items": {"type": "object"}},
         "tags": {"type": "array", "items": {"type": "string"}},
@@ -536,17 +558,27 @@ def _parse_ocr(lines: list) -> list:
 
 _CAUSAL_TYPES = ("env->action", "env->emotion", "emotion->action", "action->env",
                  "other->action", "other->env", "other->emotion")
+# Edge strength shares one ladder with psychology.awareness (weak/moderate/strong == low/medium/high).
+_STRENGTH_LEVELS = ("strong", "moderate", "weak")
+_STRENGTH_RANK = {"": 0, "weak": 1, "moderate": 2, "strong": 3}
+_AWARENESS_RANK = {"low": 1, "medium": 2, "high": 3}
 
 
 def _parse_causal(lines: list) -> list:
     """Parse a [Causal] fallback section. Lines look like:
-      `env->action: 11:10:15 手机震动 -> 11:10:16 我拿起手机`
-    Type is the token before the colon; cause/effect split on '->' (or '=>' / '→')."""
+      `env->action: 11:10:15 手机震动 -> 11:10:16 我拿起手机 (strong)`
+    Type is the token before the colon; cause/effect split on '->' (or '=>' / '→');
+    an optional '(strong|moderate|weak)' anywhere in the line grades the edge."""
     out = []
     for ln in lines:
         ln = _strip_bullet(ln).translate(_QUOTE_PAIRS)
         if not ln:
             continue
+        strength = ""
+        sm = re.search(r"\(\s*(strong|moderate|weak)\s*\)", ln, re.IGNORECASE)
+        if sm:
+            strength = sm.group(1).lower()
+            ln = (ln[: sm.start()] + ln[sm.end():]).strip()
         typ, rest = "", ln
         m = re.match(r"^\[?([a-z]+->[a-z]+)\]?\s*[:：]\s*(.+)$", ln)
         if m and m.group(1) in _CAUSAL_TYPES:
@@ -556,8 +588,23 @@ def _parse_causal(lines: list) -> list:
             if sep in rest:
                 cause, effect = (p.strip() for p in rest.split(sep, 1))
                 break
-        out.append({"type": typ, "cause": cause, "effect": effect})
+        out.append({"type": typ, "cause": cause, "effect": effect, "strength": strength})
     return out
+
+
+def _check_awareness_consistency(layered: dict, clip_id: str) -> None:
+    """Warn (not fail) when an emotion->action edge is graded stronger than
+    psychology.awareness — they are supposed to share one ladder."""
+    edges = [e.get("strength", "") for e in layered.get("causal_links") or []
+             if e.get("type") == "emotion->action"]
+    if not edges:
+        return
+    strongest = max(edges, key=lambda s: _STRENGTH_RANK.get(s, 0))
+    awareness = (layered.get("psychology") or {}).get("awareness", "")
+    if _STRENGTH_RANK.get(strongest, 0) > _AWARENESS_RANK.get(awareness, 0):
+        logging.getLogger("caption_pipeline").warning(
+            f"[{clip_id}] awareness '{awareness}' understates emotion->action edge strength "
+            f"'{strongest}' (same ladder: low/medium/high == weak/moderate/strong)")
 
 
 def parse_layered_caption(text: str) -> dict:
@@ -641,9 +688,12 @@ def parse_json_caption(content: str) -> dict:
 
     def _norm_causal(c):
         if not isinstance(c, dict):
-            return {"type": "", "cause": str(c), "effect": ""}
+            return {"type": "", "cause": str(c), "effect": "", "strength": ""}
+        strength = str(c.get("strength", "") or "").strip().lower()
+        if strength not in _STRENGTH_LEVELS:
+            strength = ""
         return {"type": str(c.get("type", "") or ""), "cause": str(c.get("cause", "") or ""),
-                "effect": str(c.get("effect", "") or "")}
+                "effect": str(c.get("effect", "") or ""), "strength": strength}
 
     psych = data.get("psychology") or {}
     return {
@@ -705,7 +755,8 @@ class CaptionRecord:
     env_changes: list = None     # [{time, time_end, text, cause}] — atomic state transitions
     speech: list = None          # [{lang, speaker, text}]
     psychology: dict = None      # {awareness, emotion, note} — awareness grades emotion->action
-    causal_links: list = None    # [{type, cause, effect}] — directed env<->action<->emotion edges
+    causal_links: list = None    # [{type, cause, effect, strength}] — strength-graded directed
+                                  # env<->action<->emotion edges (strength ~ awareness ladder)
     ocr: list = None             # [{where, text, note}]  (optional layer; empty if no text surface)
     clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
     output_format: str = "json"  # "json" | "fallback_sectioned"
@@ -796,6 +847,8 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         else:
             return None, UsageRecord(clip_id, gid, attempt, round(latency, 3),
                                      OUTCOME_PARSE_FAILED, usage, content)
+
+    _check_awareness_consistency(layered, clip_id)
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     recovery = "fallback_sectioned" if output_format == "fallback_sectioned" else "ok"

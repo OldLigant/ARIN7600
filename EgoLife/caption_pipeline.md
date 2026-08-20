@@ -1,10 +1,10 @@
 # caption_pipeline — EgoLife 原子化结构化行为标注
 
 > 用 Mimo-V2.5 全模态模型，把第一人称（Meta Aria）视频段标注成**面向数字孪生/模拟的原子化结构化 JSON**：
-> 自身动作 / 他人动作 / 整体环境 / 环境原子变化 / 语音 / 心理（`awareness` 情绪-行为驱动力评级）/ 因果边 `causal_links` / OCR（可选）。
+> 自身动作 / 他人动作 / 整体环境 / 环境原子变化 / 语音 / 心理（`awareness` 情绪-行为驱动力评级）/ 因果边 `causal_links`（带 `strength` 三档强度）/ OCR（可选）。
 > 单文件自包含，不依赖兄弟模块。
 >
-> **核心思想**：情绪驱动动作，动作改变环境，环境反过来影响动作与情绪——`causal_links` 显式记录这张有向因果图。
+> **核心思想**：情绪驱动动作，动作改变环境，环境反过来影响动作与情绪——`causal_links` 显式记录这张**带强度权重**的有向因果图。
 >
 > **默认行为**：每个 ~30s 源视频被切成 3 段 ~10s 片段分别标注（颗粒度更细、首次拒绝率更低）；**thinking 默认开启**（因果推断是推理密集任务）。
 > 用 `--clip-duration` 选择切分粒度（5/6/10/15/30）；30 = 不切分（一段源视频一个 caption，旧行为）。
@@ -25,7 +25,7 @@
 | **环境变化** | `env_changes` | 片段内可观察的**原子状态迁移**：物体出现/消失/移动、设备状态改变（屏幕亮/灭、门开、瓶盖拧开）、光线变化、人进出画面；`cause ∈ {self, other, external}` 归因 | ✅ 同一时间轴 |
 | **语音** | `speech` | 关键话语；`lang` + 说话人 + 引号文本 | ❌（模型音视不严格对齐，不强求） |
 | **心理** | `psychology` | `awareness` 等级 + `emotion` 分类 + 可选 `note` | 整段一个 |
-| **因果边** | `causal_links` | 有向因果边 `{type, cause, effect}`，7 种类型见下 | cause/effect 短语内嵌时间 |
+| **因果边** | `causal_links` | 有向因果边 `{type, cause, effect, strength}`，7 种类型见下 | cause/effect 短语内嵌时间 |
 | **OCR（可选）** | `ocr` | 纸/白板/屏幕/招牌上**大量可读文字**时才填；`{where, text, note}`。不填默认 `[]`。**不 OCR 水印。** | ❌ |
 
 ### 原子化原则（取代数量配额）
@@ -56,21 +56,34 @@ emotion ──emotion->action──> self_actions ──action->env──> env_c
 |---|---|---|
 | `env->action` | 环境事件改变我的行为 | 手机震动 → 我拿起手机 |
 | `env->emotion` | 环境事件改变我的情绪 | 巨响 → 受惊/烦躁 |
-| `emotion->action` | 我的情绪直接驱动行为 | 无聊 → 开始刷手机；与 `awareness` 互补（后者给同一条边分级） |
+| `emotion->action` | 我的情绪直接驱动行为 | 无聊 → 开始刷手机；须与 `awareness` 同档一致（同一阶梯） |
 | `action->env` | 我的动作改变环境 | 我拨开关 → 灯亮；与 `cause="self"` 的 `env_changes` 互为镜像 |
 | `other->action` | 他人动作触发我的动作 | 同事招手 → 我走过去 |
 | `other->env` | 他人动作改变环境 | 她拉开窗帘 → 房间变亮 |
 | `other->emotion` | 他人动作改变我的情绪 | 客人笑了 → 我放松 |
 
-各层在模拟中的角色：`self_actions` = agent 的控制输入（动作空间），`env_changes` = 环境状态转移（转移函数监督信号），`environment` = 初始场景上下文，`emotion` = 内部状态，`causal_links` = 因果图的边，`awareness` = emotion→action 边的强度分级。
+每条边带**必填的 `strength`** 三档强度（反事实定义——"没有这个因，果还会发生吗"）：
+
+| strength | 定义 | 例子 |
+|---|---|---|
+| **strong** | 触发：没有此因，果大概率不会发生（或走向不同方向） | 手机震动 → 我拿起手机；我拨开关 → 灯亮 |
+| **moderate** | 塑形：此因改变了果的发生方式/时机/力度，但果本来也会发生 | 无聊 → 刷手机变快；对方语气 → 我回答更谨慎 |
+| **weak** | 背景：只是多个促成因素之一，果主要由习惯/任务驱动 | 轻微疲惫 → 揉一次眼睛 |
+
+物理性边（`action->env`、`other->env`）几乎总是 `strong`，属正常而非偷懒。诚实分级，不用弱背景边凑数。
+**omit 的语义收紧为"怀疑这条边存在"**——真实但微弱的影响用 `weak` 如实记录，而不是丢弃；
+存在性、强度两个维度就此分开。
+
+各层在模拟中的角色：`self_actions` = agent 的控制输入（动作空间），`env_changes` = 环境状态转移（转移函数监督信号），`environment` = 初始场景上下文，`emotion` = 内部状态，`causal_links` = 因果图的**加权**边，`awareness` = emotion→action 边的强度摘要（与 `strength` 同一阶梯）。
 
 **有意的冗余**："我拿起杯子"（`self_actions`）与"杯子离开桌面进入我手中"（`env_changes`, `cause=self`）是同一事件的两个视角——一个是控制输入，一个是状态转移。模拟训练两边都要，所以两边都标。
 
-**证据约束**：因果方向必须有可见时序 + 合理机制支撑，存疑则不标（宁缺勿滥）；0-3 条是常态，空数组合法。
+**证据约束**：因果方向必须有可见时序 + 合理机制支撑，怀疑边**存在**则不标；真实但微弱的影响用 `weak` 记录。0-3 条是常态，空数组合法。
 
 ### awareness 三档定义（核心）
 
-`awareness` 衡量**情绪在多大程度上因果地驱动了可见行为**：
+`awareness` 衡量**情绪在多大程度上因果地驱动了可见行为**——它就是 emotion→action 边的
+`strength` 摘要，同一阶梯（low/medium/high ↔ weak/moderate/strong）：
 
 | 等级 | 定义 | 例子 |
 |---|---|---|
@@ -79,6 +92,8 @@ emotion ──emotion->action──> self_actions ──action->env──> env_c
 | **high** | 情绪**直接触发**了一个行为反应或转折 | 尴尬→伸手遮脸；生气→拍桌；焦虑→放下手头事起身离开 |
 
 `low/medium` 段是"情绪背景"，`high` 段是"情绪-行为转换点"——后者是我们要捕捉的核心研究对象。
+`awareness` 必须与任何写出的 `emotion->action` 边同档一致；边太弱不值得单写一条时 awareness
+照填（`low` 且无边是正常的）。管线在落盘前做一致性校验，发现 awareness 低估了边强度时打 warning。
 
 ---
 
@@ -191,8 +206,8 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
     "note": "作为协调者引导设备操作测试。"
   },
   "causal_links": [
-    {"type": "other->action", "cause": "11:10:12 白衣女生轮流点击手机屏幕测试", "effect": "11:10:15 我拿起麦克风准备录音"},
-    {"type": "action->env", "cause": "11:10:17 我拨动开关", "effect": "11:10:18 麦克风电源接通"}
+    {"type": "other->action", "cause": "11:10:12 白衣女生轮流点击手机屏幕测试", "effect": "11:10:15 我拿起麦克风准备录音", "strength": "moderate"},
+    {"type": "action->env", "cause": "11:10:17 我拨动开关", "effect": "11:10:18 麦克风电源接通", "strength": "strong"}
   ],
   "ocr": [
     {"where": "whiteboard", "text": "日程安排\n1. 站会", "note": "handwriting"}
@@ -220,8 +235,8 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 - `environment`：整段一两句的**整体场景**（模拟器放置 agent 的上下文）；片段内的变化不写在这里。
 - `env_changes`：`[{time, time_end, text, cause}]`，片段内每次可观察的原子状态迁移；`cause ∈ {self, other, external}`（`external` = 无可见行为主体：自动门、天气、定时器）。
 - `speech`：`[{lang, speaker, text}]`，`lang ∈ {zh, en, ""}`。
-- `psychology`：`{awareness, emotion, note}`，缺失字段为空串。
-- `causal_links`：`[{type, cause, effect}]`，`type` 为 7 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；空数组合法（无可辩护的因果边时）。
+- `psychology`：`{awareness, emotion, note}`，缺失字段为空串；`awareness` 为 emotion→action 边的强度摘要（与 `strength` 同梯：low/medium/high ↔ weak/moderate/strong）。
+- `causal_links`：`[{type, cause, effect, strength}]`，`type` 为 7 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；`strength ∈ {strong, moderate, weak}`（反事实三档，见第 1 节；模型漏写或写非法值时宽松归一化为 `""`，不整单拒绝）；空数组合法（无可辩护的因果边时）。
 - `ocr`：`[{where, text, note}]`，**可选层**。`where ∈ {whiteboard, paper, screen, sign, other}`；`text` 为可读内容（尽量逐字）；`note` 可选（如"手写不清晰"）。**不 OCR 时间水印**。无可读文字表面时为 `[]`。
 - `narrative`：模型原始 JSON 全文（未解析），保完整以便人工核查/重新解析。
 - `clip_kind`：`30s`（不切分的标准源）/ `segment_open`（一天开头的不规则短段，如 `11094208`）/ `10s`/`15s`/`6s`/`5s`（切分片段）。`60s`（合并）已移除。
@@ -310,8 +325,9 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 - **thinking 默认开启、成本高**：原子分解 + 因果推断是推理密集任务，默认 `--thinking enabled --max-completion-tokens 8192`，
   单次延迟/token 约 ×3-4（reasoning 占大头）。省钱跑法：`--thinking disabled --max-completion-tokens 2048`，
   动作/环境层质量基本不变，`causal_links` 变稀疏且更浅。
-- **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，存疑则省"，
-  且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。
+- **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，怀疑边存在才省略"，
+  且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。`strength` 是模型的主观三档
+  判断（反事实定义），聚合时建议按 strong/moderate/weak → 1.0/0.5/0.25 加权，或仅取 strong 边做硬约束。
 - **JSON 模式偶发 code-fence**：极少数情况模型无视 `json_object` 模式仍输出 ` ```json ` 围栏或
   sectioned 文本——解析器已兜底（剥围栏 / 回退 sectioned 解析，含 `[Envchanges]`/`[Causal]` 节），不影响可用性。
 - **单 participant 单 day**：跨天/跨参与者需起多个进程，注意共享 RPM 配额（调低单进程 `--max-rpm`）。
