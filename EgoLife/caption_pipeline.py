@@ -1,8 +1,13 @@
 """caption_pipeline.py — self-contained Mimo captioning pipeline for EgoLife.
 
-Turns first-person (Meta Aria) video segments into 5-layer (+optional OCR)
-structured JSON annotations: self_actions / others / environment / speech /
-psychology (with an `awareness` field scoring how strongly emotion drove behavior).
+Turns first-person (Meta Aria) video segments into simulation-grade ATOMIC annotations
+for a life digital twin: self_actions / others / environment (overall scene) /
+env_changes (atomic state transitions, cause-attributed) / speech / psychology
+(emotion + awareness) / causal_links (directed env<->action<->emotion edges),
+plus optional OCR. The schema encodes the causal loop a simulator needs:
+emotion drives actions, actions mutate the environment, the environment feeds
+back into both actions and emotion. `awareness` grades the emotion->action edge;
+`causal_links` records the observable directed edges explicitly.
 
 By default each ~30s source file is split into 3 x ~10s pieces and each piece is
 captioned independently (finer granularity, lower per-call rejection rate). Use
@@ -20,8 +25,12 @@ Architecture
 
 Usage
 -----
-  # standard run: 10s pieces (default), JSON output, no thinking
+  # standard run: 10s pieces (default), JSON output, thinking ON (causal
+  # annotation is reasoning-heavy; ~4x latency/tokens vs non-thinking)
   python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
+  # cheaper/faster: no reasoning chain (action/env layers still fine, causal
+  # links get noticeably weaker)
+  python caption_pipeline.py --thinking disabled --max-completion-tokens 2048
   # legacy: one caption per 30s source file (no splitting)
   python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
   # time-windowed
@@ -30,8 +39,6 @@ Usage
   python caption_pipeline.py --skip-existing
   # caption only (slices already encoded in _cache/)
   python caption_pipeline.py --skip-preprocess
-  # higher quality (more granular actions, ~4x latency/token cost)
-  python caption_pipeline.py --thinking enabled --max-completion-tokens 8192
 """
 from __future__ import annotations
 
@@ -74,8 +81,8 @@ ROOT = Path(__file__).resolve().parent  # .../ARIN7600/EgoLife/
 # Constants & prompt
 # ===========================================================================
 
-MAX_COMPLETION_TOKENS = 1024       # raise to ~8192 when thinking=enabled
-THINKING_DEFAULT = "disabled"      # "enabled" | "disabled"
+MAX_COMPLETION_TOKENS = 8192       # thinking shares this budget with the JSON body
+THINKING_DEFAULT = "enabled"       # causal-graph annotation is reasoning-heavy; disable for ~4x speedup
 
 # ffmpeg re-encode defaults (1024x1024 @ 2fps is the validated sweet spot:
 # watermark readable, whiteboard legible, ~2MB / 30s clip).
@@ -88,7 +95,10 @@ DEFAULT_AUDIO_BITRATE_K = 64
 # break (e.g. the multi-hour gaps in EgoLife). 60s pairing never bridges these.
 _GAP_THRESHOLD_S = 35.0
 
-SYSTEM_MSG = """You are a dense first-person life-log captioner.
+SYSTEM_MSG = """You are a dense first-person life-log captioner producing SIMULATION-GRADE atomic
+annotations. Your output feeds a digital twin of the wearer's daily life, so it must capture not
+only WHAT happened but the causal structure of the clip: emotion drives actions, actions change
+the environment, and the environment feeds back into both actions and emotion.
 The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
 
 # Watermark anchor (CRITICAL)
@@ -109,31 +119,54 @@ Use exactly this structure (fill every field; use empty arrays/strings when a se
     {"time": "HH:MM:SS", "time_end": "HH:MM:SS", "text": "..."}
   ],
   "environment": "...",
+  "env_changes": [
+    {"time": "HH:MM:SS", "time_end": "HH:MM:SS", "text": "...", "cause": "self"}
+  ],
   "speech": [
     {"lang": "zh", "speaker": "...", "text": "..."}
   ],
   "psychology": {"awareness": "low", "emotion": "...", "note": "..."},
+  "causal_links": [
+    {"type": "env->action", "cause": "...", "effect": "..."}
+  ],
   "ocr": [{"where": "whiteboard", "text": "...", "note": "..."}],
   "tags": ["..."]
 }
 
 ## Field rules
 
-self_actions: one object per discrete self-action, in first person ("I"), present tense, verb-led.
-Cover the whole clip span. Each "time"/"time_end" is a watermark-based HH:MM:SS (~2-5s resolution).
-Describe hand-object contact, posture, gaze, locomotion, device use. Mirror these real examples:
-{"time":"11:10:02","time_end":"11:10:08","text":"我拿起手机划开屏幕"} /
-{"time":"11:10:22","time_end":"11:10:30","text":"我把手机传给一位穿着黄色上衣的女士"}.
-The user message gives a SUGGESTED action count for this clip's duration — treat it as guidance,
-not a quota: if the scene is genuinely low-action (sitting, waiting, one long task), fewer actions
-is correct; do not pad or invent. Use Chinese when the scene is Chinese-speaking. Never invent names
-for yourself; use neutral descriptors for others unless their name is shown or spoken.
+self_actions: one object per ATOMIC self-action, in first person ("I"), present tense, verb-led.
+An atomic action is a single verb-level step with one object and one immediate goal: reach, grasp,
+pick up, put down, open, close, turn on, flip, slide, look at, walk to, sit down. DECOMPOSE compound
+behavior: "我拿起手机划开屏幕看消息" must become at least "我拿起手机" + "我划开屏幕" + "我低头浏览消息".
+Conversely, do NOT split one continuous gesture into artificial micro-frames, and do NOT merge
+separate manipulations into one entry. There is NO count quota — atomicity is the standard, not
+quantity: a dense 10s of object manipulation may need 6-10 entries; a still 10s of sitting may
+honestly be 1-2 entries. Cover the whole clip span. Each "time"/"time_end" is a watermark-based
+HH:MM:SS (~1-3s resolution). Describe hand-object contact, posture, gaze, locomotion, device use.
+Use Chinese when the scene is Chinese-speaking. Never invent names for yourself; use neutral
+descriptors for others unless their name is shown or spoken.
 
-others: zero or more objects, same shape, timestamped the same way. Lead text with the person
-descriptor ("a woman in blue", "Shure"). Empty array if you are alone.
+others: zero or more objects, same shape and same atomicity standard, timestamped the same way.
+Lead text with the person descriptor ("a woman in blue", "Shure"). Empty array if you are alone.
 
-environment: one or two sentences on the setting and any CHANGES during the clip: room, lighting,
-screen content, object layout, weather/outdoor cues, location transitions. Empty string if static.
+environment: one or two sentences on the OVERALL setting — the relatively stable backdrop the clip
+happens in: place type, room layout, lighting, general screen content, weather/indoor-outdoor cues.
+This is the context a simulator would place the agent into, so it should read like a scene
+description, NOT a changelog. In-clip CHANGES belong in env_changes, not here (a location
+transition appears both as a one-clause note here and as env_changes entries). Empty string if
+truly nothing identifiable.
+
+env_changes: one object per ATOMIC observable state change of the environment DURING this clip:
+an object appears / disappears / moves; a device or aperture changes state (screen lights up or
+sleeps, door opens, cap comes off, cup empties); lighting or soundscape shifts; layout is
+rearranged; a person enters or leaves the scene. Even in a short clip the environment is a
+stateful actor, not a static backdrop — report every discrete transition you can see. Timestamp
+each entry like an action. Every entry carries "cause": "self" (my action did it), "other"
+(another person's action did it), or "external" (no visible agent — automatic door, weather,
+a timer). Changes are the object-level mirror of actions: if I pick up a cup, the pick-up is a
+self_action AND "杯子离开桌面进入我手中" is an env_change with cause "self". Only report changes
+actually visible in this clip. Empty array if the environment truly does not change.
 
 speech: zero or more objects. lang in {"zh","en"}; speaker optional; text is the quoted utterance.
 Transcribe only what is actually heard; do not invent. Speech has no reliable timestamp from the
@@ -157,13 +190,32 @@ psychology: an object with exactly:
   high   = emotion directly triggered a behavior or a turn/pivot (e.g. embarrassment -> covering face).
 "emotion" picks from: neutral calm relaxed bored focused amused happy excited surprised confused
 curious anxious nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
+When an environment event or another person is what moved your emotion, say so in "note" and also
+record it as an "env->emotion" or "other->emotion" causal_link.
+
+causal_links: the directed causal edges you can observe or confidently infer WITHIN this clip.
+One object per edge: {"type": "...", "cause": "<short phrase, prefix with HH:MM:SS when clear>",
+"effect": "<short phrase, prefix with HH:MM:SS when clear>"}. Use EXACTLY these "type" strings:
+  "env->action"     an environment event/state changed MY behavior (phone vibrates -> I pick it up).
+  "env->emotion"    an environment event changed my emotion (loud noise -> startled/annoyed).
+  "emotion->action" my emotion directly drove my behavior (bored -> I start scrolling my phone);
+                    complements psychology.awareness, which grades this same edge.
+  "action->env"     my action changed the environment (I flip the switch -> lights turn on);
+                    mirrors env_changes entries with cause "self".
+  "other->action"   another person's action triggered my action (colleague waves me over -> I walk over).
+  "other->env"      another person's action changed the environment (she opens the curtain -> room brightens).
+  "other->emotion"  another person's action changed my emotion (guest laughs -> I relax).
+Rules: the causal direction must be visible or strongly implied by temporal order and mechanism —
+never fabricate; when in doubt, omit the edge. 0-3 links is typical; empty array is fine. Quote the
+atomic action / change texts (with their times) rather than vague summaries.
 
 tags: 5-10 short lowercase keywords (objects, actions, location, people descriptors). MANDATORY,
 never empty.
 
 # Rules
 - Stay strictly within the watermark time range of THIS clip; never describe other videos.
-- Be concrete and observational; do not speculate beyond what is visible or audible.
+- Be concrete and observational; do not speculate beyond what is visible or audible. causal_links
+  must stay evidence-based (visible temporal order + plausible mechanism).
 - Pick ONE language for all fields based on the dominant spoken language in the clip (Chinese if
   participants speak Chinese, English otherwise). Do NOT translate or duplicate content.
 - Output each action, utterance, or fact exactly ONCE; never repeat in another language.
@@ -172,28 +224,13 @@ never empty.
 USER_TASK_TMPL = (
     "Annotate this {duration_desc} first-person video ({clip_id}) and return the JSON object.\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
-    "Read the top-right watermark (HH:MM:SS:FF {day_label}) to timestamp the self_actions and others. "
-    "Cover the full segment from {start_hms} onward.\n"
-    "Suggested self_actions count for this ~{target_s}s clip: {n_min}-{n_max} "
-    "(guidance only — fewer is fine when the scene is genuinely low-action)."
+    "Read the top-right watermark (HH:MM:SS:FF {day_label}) to timestamp the self_actions, others "
+    "and env_changes. Cover the full segment from {start_hms} onward.\n"
+    "Decompose what happens into ATOMIC actions and ATOMIC environment state changes — there is NO "
+    "count quota; atomicity is the standard. Then record every causal edge you can defend from the "
+    "clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
+    "other->env, other->emotion."
 )
-
-# Suggested self_actions count by clip-duration target. Passed into the user message as
-# GUIDANCE ONLY — the model is explicitly told fewer is fine for low-action scenes.
-ACTION_COUNT_GUIDE = {30: (4, 8), 15: (3, 6), 10: (3, 6), 6: (2, 4), 5: (2, 4)}
-
-
-def suggested_action_count(target_s: int) -> tuple[int, int]:
-    """Look up the (min, max) suggested self_actions count for a clip-duration target.
-    Falls back to the nearest shorter target if an unknown value slips through."""
-    if target_s in ACTION_COUNT_GUIDE:
-        return ACTION_COUNT_GUIDE[target_s]
-    # nearest-key fallback (defensive; CLI choices are all in the table)
-    keys = sorted(ACTION_COUNT_GUIDE, reverse=True)
-    for k in keys:
-        if target_s >= k:
-            return ACTION_COUNT_GUIDE[k]
-    return ACTION_COUNT_GUIDE[keys[-1]]
 
 
 # ===========================================================================
@@ -354,7 +391,7 @@ _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 _TAGS_RE = re.compile(r"^Tags:\s*(.+)$", re.MULTILINE)
 _TS_RANGE_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})(?:\s*-\s*(\d{2}:\d{2}:\d{2}))?\s*(.*)$")
 _SPEECH_RE = re.compile(r"^\[(zh|en|other)\]\s*(.*)$", re.IGNORECASE)
-_SECTION_HEADERS = ("Self", "Others", "Environment", "Speech", "Psychology", "Ocr", "Tags")
+_SECTION_HEADERS = ("Self", "Others", "Environment", "Envchanges", "Causal", "Speech", "Psychology", "Ocr", "Tags")
 _QUOTE_PAIRS = str.maketrans({"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"})
 
 _ANNOTATION_SCHEMA = {
@@ -363,6 +400,7 @@ _ANNOTATION_SCHEMA = {
         "self_actions": {"type": "array", "items": {"type": "object"}},
         "others": {"type": "array", "items": {"type": "object"}},
         "environment": {"type": "string"},
+        "env_changes": {"type": "array", "items": {"type": "object"}},
         "speech": {"type": "array", "items": {"type": "object"}},
         "psychology": {
             "type": "object",
@@ -373,6 +411,7 @@ _ANNOTATION_SCHEMA = {
             },
             "required": ["awareness", "emotion"],
         },
+        "causal_links": {"type": "array", "items": {"type": "object"}},
         "ocr": {"type": "array", "items": {"type": "object"}},
         "tags": {"type": "array", "items": {"type": "string"}},
     },
@@ -495,6 +534,32 @@ def _parse_ocr(lines: list) -> list:
     return out
 
 
+_CAUSAL_TYPES = ("env->action", "env->emotion", "emotion->action", "action->env",
+                 "other->action", "other->env", "other->emotion")
+
+
+def _parse_causal(lines: list) -> list:
+    """Parse a [Causal] fallback section. Lines look like:
+      `env->action: 11:10:15 手机震动 -> 11:10:16 我拿起手机`
+    Type is the token before the colon; cause/effect split on '->' (or '=>' / '→')."""
+    out = []
+    for ln in lines:
+        ln = _strip_bullet(ln).translate(_QUOTE_PAIRS)
+        if not ln:
+            continue
+        typ, rest = "", ln
+        m = re.match(r"^\[?([a-z]+->[a-z]+)\]?\s*[:：]\s*(.+)$", ln)
+        if m and m.group(1) in _CAUSAL_TYPES:
+            typ, rest = m.group(1), m.group(2).strip()
+        cause, effect = rest, ""
+        for sep in ("->", "=>", "\u2192"):
+            if sep in rest:
+                cause, effect = (p.strip() for p in rest.split(sep, 1))
+                break
+        out.append({"type": typ, "cause": cause, "effect": effect})
+    return out
+
+
 def parse_layered_caption(text: str) -> dict:
     """Fallback parser for sectioned text (used if the model ignores json_object
     mode and emits [Self]/[Psychology] style output). Returns the same dict shape
@@ -514,8 +579,10 @@ def parse_layered_caption(text: str) -> dict:
         "self_actions": _parse_actions(sections.get("Self", [])),
         "others": _parse_actions(sections.get("Others", [])),
         "environment": " ".join(sections.get("Environment", [])).strip(),
+        "env_changes": [dict(e, cause="") for e in _parse_actions(sections.get("Envchanges", []))],
         "speech": _parse_speech(sections.get("Speech", [])),
         "psychology": _parse_psychology(sections.get("Psychology", [])),
+        "causal_links": _parse_causal(sections.get("Causal", [])),
         "ocr": _parse_ocr(sections.get("Ocr", [])),
         "tags": tags,
     }
@@ -566,17 +633,31 @@ def parse_json_caption(content: str) -> dict:
         return {"where": str(o.get("where", "") or ""), "text": str(o.get("text", "") or ""),
                 "note": str(o.get("note", "") or "")}
 
+    def _norm_env_change(e):
+        if not isinstance(e, dict):
+            return {"time": "", "time_end": "", "text": str(e), "cause": ""}
+        return {"time": str(e.get("time", "") or ""), "time_end": str(e.get("time_end", "") or ""),
+                "text": str(e.get("text", "") or ""), "cause": str(e.get("cause", "") or "")}
+
+    def _norm_causal(c):
+        if not isinstance(c, dict):
+            return {"type": "", "cause": str(c), "effect": ""}
+        return {"type": str(c.get("type", "") or ""), "cause": str(c.get("cause", "") or ""),
+                "effect": str(c.get("effect", "") or "")}
+
     psych = data.get("psychology") or {}
     return {
-        "self_actions": [_norm_action(a) for a in data.get("self_actions", [])],
-        "others": [_norm_action(a) for a in data.get("others", [])],
+        "self_actions": [_norm_action(a) for a in data.get("self_actions", []) or []],
+        "others": [_norm_action(a) for a in data.get("others", []) or []],
         "environment": str(data.get("environment", "") or ""),
-        "speech": [_norm_speech(s) for s in data.get("speech", [])],
+        "env_changes": [_norm_env_change(e) for e in data.get("env_changes", []) or []],
+        "speech": [_norm_speech(s) for s in data.get("speech", []) or []],
         "psychology": {"awareness": str(psych.get("awareness", "") or ""),
                        "emotion": str(psych.get("emotion", "") or ""),
                        "note": str(psych.get("note", "") or "")},
-        "ocr": [_norm_ocr(o) for o in data.get("ocr", [])],
-        "tags": [str(t) for t in data.get("tags", [])],
+        "causal_links": [_norm_causal(c) for c in data.get("causal_links", []) or []],
+        "ocr": [_norm_ocr(o) for o in data.get("ocr", []) or []],
+        "tags": [str(t) for t in data.get("tags", []) or []],
     }
 
 
@@ -618,11 +699,13 @@ class CaptionRecord:
     ts_captioned: str
     slice_path: str
     tokens: dict
-    self_actions: list = None    # [{time, time_end, text}]
-    others: list = None          # [{time, time_end, text}]
-    environment: str = ""
+    self_actions: list = None    # [{time, time_end, text}] — atomic, verb-level steps
+    others: list = None          # [{time, time_end, text}] — same atomicity standard
+    environment: str = ""        # overall scene backdrop (simulator context), not a changelog
+    env_changes: list = None     # [{time, time_end, text, cause}] — atomic state transitions
     speech: list = None          # [{lang, speaker, text}]
-    psychology: dict = None      # {awareness, emotion, note}
+    psychology: dict = None      # {awareness, emotion, note} — awareness grades emotion->action
+    causal_links: list = None    # [{type, cause, effect}] — directed env<->action<->emotion edges
     ocr: list = None             # [{where, text, note}]  (optional layer; empty if no text surface)
     clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
     output_format: str = "json"  # "json" | "fallback_sectioned"
@@ -662,11 +745,9 @@ def make_user_message(video_path: Path, clip_row: pd.Series, is_10s: bool = Fals
         duration_desc = "10-second"
     else:
         duration_desc = f"~{target_s}-second"
-    n_min, n_max = suggested_action_count(target_s if not is_10s else 10)
     task = USER_TASK_TMPL.format(
         clip_id=clip_row["clip_id"], src_file=src, day_label=day_label,
         start_hms=start_hms, duration_desc=duration_desc,
-        target_s=(10 if is_10s else target_s), n_min=n_min, n_max=n_max,
     )
     return {"role": "user", "content": [
         {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64_video(video_path)}"}, "fps": 2},
@@ -724,7 +805,8 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         model=model, ts_captioned=ts, slice_path=clip_row["slice_path"],
         tokens={"in": usage["prompt_tokens"], "out": usage["completion_tokens"], "cached": usage["cached_tokens"]},
         self_actions=layered["self_actions"], others=layered["others"], environment=layered["environment"],
-        speech=layered["speech"], psychology=layered["psychology"], ocr=layered["ocr"],
+        env_changes=layered["env_changes"], speech=layered["speech"], psychology=layered["psychology"],
+        causal_links=layered["causal_links"], ocr=layered["ocr"],
         clip_kind=clip_row.get("clip_kind", "30s"), output_format=output_format, recovery=recovery,
     )
     use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), recovery, usage)
@@ -1260,9 +1342,14 @@ def main():
     ap.add_argument("--env-file", type=Path, default=None,
                     help=".env file to load MIMO_API_KEY from (default: search CWD + script dir)")
     ap.add_argument("--thinking", default=THINKING_DEFAULT, choices=["enabled", "disabled"],
-                    help="reasoning mode. When enabled, raise --max-completion-tokens (e.g. 8192). "
+                    help="reasoning mode (default: enabled — causal-graph annotation is "
+                         "reasoning-heavy). Use --thinking disabled --max-completion-tokens 2048 "
+                         "for ~4x cheaper/faster runs (causal_links quality drops). "
                          "Under thinking Mimo ignores temperature/top_p.")
-    ap.add_argument("--max-completion-tokens", type=int, default=MAX_COMPLETION_TOKENS)
+    ap.add_argument("--max-completion-tokens", type=int, default=MAX_COMPLETION_TOKENS,
+                    help="completion budget shared by reasoning tokens and the JSON body. "
+                         "8192 fits thinking + the enriched schema; 2048 suffices with "
+                         "--thinking disabled.")
     ap.add_argument("--no-json-mode", action="store_true",
                     help="disable response_format=json_object (debug; falls back to sectioned parser)")
     # --- Concurrency ---
@@ -1603,7 +1690,8 @@ def main():
         "model": args.model, "participant": args.participant, "day": args.day,
         "time_range": {"start": args.start_time, "end": args.end_time},
         "clip_duration": args.clip_duration, "thinking": args.thinking, "json_mode": json_mode,
-        "max_completion_tokens": args.max_completion_tokens, "temperature": 1.0,
+        "max_completion_tokens": args.max_completion_tokens,
+        "temperature": (1.0 if args.thinking == "disabled" else None),
         "max_rpm": args.max_rpm, "api_workers": args.api_workers,
         "preprocess_workers": args.preprocess_workers,
         "skip_preprocess": args.skip_preprocess, "skip_existing": args.skip_existing,

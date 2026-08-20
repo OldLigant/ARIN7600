@@ -1,10 +1,12 @@
-# caption_pipeline — EgoLife 结构化行为标注
+# caption_pipeline — EgoLife 原子化结构化行为标注
 
-> 用 Mimo-V2.5 全模态模型，把第一人称（Meta Aria）视频段标注成 **5 层 + 可选 OCR 结构化 JSON**：
-> 自身动作 / 他人动作 / 环境 / 语音 / 心理（含 `awareness` 情绪-行为驱动力评级）/ OCR（可选）。
+> 用 Mimo-V2.5 全模态模型，把第一人称（Meta Aria）视频段标注成**面向数字孪生/模拟的原子化结构化 JSON**：
+> 自身动作 / 他人动作 / 整体环境 / 环境原子变化 / 语音 / 心理（`awareness` 情绪-行为驱动力评级）/ 因果边 `causal_links` / OCR（可选）。
 > 单文件自包含，不依赖兄弟模块。
 >
-> **默认行为**：每个 ~30s 源视频被切成 3 段 ~10s 片段分别标注（颗粒度更细、首次拒绝率更低）。
+> **核心思想**：情绪驱动动作，动作改变环境，环境反过来影响动作与情绪——`causal_links` 显式记录这张有向因果图。
+>
+> **默认行为**：每个 ~30s 源视频被切成 3 段 ~10s 片段分别标注（颗粒度更细、首次拒绝率更低）；**thinking 默认开启**（因果推断是推理密集任务）。
 > 用 `--clip-duration` 选择切分粒度（5/6/10/15/30）；30 = 不切分（一段源视频一个 caption，旧行为）。
 
 ---
@@ -13,33 +15,60 @@
 
 输入：EgoLife 第一人称视频（参与者戴着 Meta Aria 眼镜录制），默认按 10s 切分。
 
-输出：一个 JSON 对象，包含 6 个层：
+输出：一个 JSON 对象，包含 8 个层：
 
 | 层 | 字段 | 内容 | 时间戳 |
 |---|---|---|---|
-| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头（DenseCaption 风格） | ✅ 读视频右上角水印 `HH:MM:SS:FF`，标 `HH:MM:SS-HH:MM:SS` 段（~2-5s 分辨率，建议数量见下表） |
-| **他人行为** | `others` | 其他人做了什么；中立称呼（"穿粉色上衣的女性"），不臆造名字 | ✅ 同一时间轴 |
-| **环境** | `environment` | 场景、光照、屏幕内容、物体布局、位置变化 | 粗粒度 |
-| **语音** | `speech` | 关键话语；`[zh]`/`[en]` + 说话人 + 引号文本 | ❌（模型音视不严格对齐，不强求） |
+| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤） | ✅ 读视频右上角水印 `HH:MM:SS:FF`，标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率） |
+| **他人行为** | `others` | 其他人做了什么；中立称呼（"穿粉色上衣的女性"），不臆造名字；同样原子化 | ✅ 同一时间轴 |
+| **环境（整体）** | `environment` | 整体场景背景：地点类型、布局、光照、天气/室内外——模拟器放置 agent 的上下文，是"场景说明"而非"变化日志" | ❌（整段一两句） |
+| **环境变化** | `env_changes` | 片段内可观察的**原子状态迁移**：物体出现/消失/移动、设备状态改变（屏幕亮/灭、门开、瓶盖拧开）、光线变化、人进出画面；`cause ∈ {self, other, external}` 归因 | ✅ 同一时间轴 |
+| **语音** | `speech` | 关键话语；`lang` + 说话人 + 引号文本 | ❌（模型音视不严格对齐，不强求） |
 | **心理** | `psychology` | `awareness` 等级 + `emotion` 分类 + 可选 `note` | 整段一个 |
+| **因果边** | `causal_links` | 有向因果边 `{type, cause, effect}`，7 种类型见下 | cause/effect 短语内嵌时间 |
 | **OCR（可选）** | `ocr` | 纸/白板/屏幕/招牌上**大量可读文字**时才填；`{where, text, note}`。不填默认 `[]`。**不 OCR 水印。** | ❌ |
 
-### self_actions 建议数量（仅建议，低动作场景可少标）
+### 原子化原则（取代数量配额）
 
-| 片段时长 | 建议 self_actions 数量 |
-|---|---|
-| 30s | 4-8 |
-| 15s | 3-6 |
-| 10s | 3-6 |
-| 6s | 2-4 |
-| 5s | 2-4 |
+不给"建议动作数"，判断标准是**原子性**，数量只是结果：
 
-这只是**建议**——如果某段确实动作少（坐着、等待、一个长任务），少标几条是对的，不要硬凑或臆造。
+- 一个条目 = 一个动词级步骤（够、拿、放、开、关、看、走、坐），单一对象、单一即时目的。
+- 复合行为必须拆解："拿起手机划开屏幕看消息" → `拿起手机` / `划开屏幕` / `浏览消息` 三条。
+- 一个连续手势不硬拆成微帧；两个独立操作不合并成一条。
+- 密集操作的 10s 出 6-10 条、静坐的 10s 出 1-2 条，都是对的——不凑数、不臆造。
+- `env_changes` 同理：一条 = 一次离散状态迁移。
 
-**为什么区分"我"与"环境"**：数字孪生（ 项目）要学的是 *self 在 context 下的反应*——
-self 行为是要预测的，others+environment 是输入上下文。混在一起就没法训练"给定环境我会怎么做"。
+### 面向模拟的因果闭环（causal_links）
 
-### awareness 三档定义（ 核心）
+数字孪生/模拟需要的不只是"发生了什么"，而是**可执行的因果结构**：
+
+```
+emotion ──emotion->action──> self_actions ──action->env──> env_changes
+   ▲   └──other->emotion──┐      ▲                            │
+   │                      │      └──other->action── others ───┤
+   └────env->emotion──────┴───────────────────────────────────┘
+   └────env->action───────────────────────────────────────────┘
+```
+
+7 种边类型（`type` 字段取值，ASCII 写法）：
+
+| type | 含义 | 例子 |
+|---|---|---|
+| `env->action` | 环境事件改变我的行为 | 手机震动 → 我拿起手机 |
+| `env->emotion` | 环境事件改变我的情绪 | 巨响 → 受惊/烦躁 |
+| `emotion->action` | 我的情绪直接驱动行为 | 无聊 → 开始刷手机；与 `awareness` 互补（后者给同一条边分级） |
+| `action->env` | 我的动作改变环境 | 我拨开关 → 灯亮；与 `cause="self"` 的 `env_changes` 互为镜像 |
+| `other->action` | 他人动作触发我的动作 | 同事招手 → 我走过去 |
+| `other->env` | 他人动作改变环境 | 她拉开窗帘 → 房间变亮 |
+| `other->emotion` | 他人动作改变我的情绪 | 客人笑了 → 我放松 |
+
+各层在模拟中的角色：`self_actions` = agent 的控制输入（动作空间），`env_changes` = 环境状态转移（转移函数监督信号），`environment` = 初始场景上下文，`emotion` = 内部状态，`causal_links` = 因果图的边，`awareness` = emotion→action 边的强度分级。
+
+**有意的冗余**："我拿起杯子"（`self_actions`）与"杯子离开桌面进入我手中"（`env_changes`, `cause=self`）是同一事件的两个视角——一个是控制输入，一个是状态转移。模拟训练两边都要，所以两边都标。
+
+**证据约束**：因果方向必须有可见时序 + 合理机制支撑，存疑则不标（宁缺勿滥）；0-3 条是常态，空数组合法。
+
+### awareness 三档定义（核心）
 
 `awareness` 衡量**情绪在多大程度上因果地驱动了可见行为**：
 
@@ -49,7 +78,7 @@ self 行为是要预测的，others+environment 是输入上下文。混在一�
 | **medium** | 情绪影响了动作的**表现形式**（语气/节奏/表情/幅度），但没改变**方向** | 开心地看着别人写字，笑得前仰后合，但还坐在原地看 |
 | **high** | 情绪**直接触发**了一个行为反应或转折 | 尴尬→伸手遮脸；生气→拍桌；焦虑→放下手头事起身离开 |
 
-`low/medium` 段是"情绪背景"，`high` 段是"情绪-行为转换点"——后者是 我们 要捕捉的核心研究对象。
+`low/medium` 段是"情绪背景"，`high` 段是"情绪-行为转换点"——后者是我们要捕捉的核心研究对象。
 
 ---
 
@@ -72,8 +101,11 @@ pip install openai pandas python-dotenv jsonschema
 然后：
 
 ```bash
-# 标注一整天（默认切 10s 片段、JSON 输出、不开 thinking）
+# 标注一整天（默认切 10s 片段、JSON 输出、thinking 开启）
 python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
+
+# 省成本/提速 ~4 倍（无推理链；动作/环境层照常，causal_links 质量明显下降）
+python caption_pipeline.py --participant A1_JAKE --day 1 --thinking disabled --max-completion-tokens 2048
 
 # 不切分：一段源视频（~30s）一个 caption（旧行为）
 python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
@@ -89,9 +121,6 @@ python caption_pipeline.py --participant A1_JAKE --day 1
 
 # 只跑 caption（slices 已在 _cache/ 里，跳过编码）
 python caption_pipeline.py --skip-preprocess
-
-# 追求最高质量（动作更细，但延迟/token ×4）
-python caption_pipeline.py --thinking enabled --max-completion-tokens 8192
 ```
 
 ### 默认目录布局
@@ -139,13 +168,20 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
   "slice_path": "_cache\\slices\\DAY1_A1_JAKE_11100000_p2.mp4",
   "tokens": {"in": 3200, "out": 210, "cached": 747},
   "self_actions": [
-    {"time": "11:10:10", "time_end": "11:10:14", "text": "我接回手机，看着女生们依次点击屏幕"},
-    {"time": "11:10:15", "time_end": "11:10:20", "text": "我左手拿起桌上的黑色麦克风并开启"}
+    {"time": "11:10:10", "time_end": "11:10:12", "text": "我接回手机"},
+    {"time": "11:10:12", "time_end": "11:10:15", "text": "我低头看女生们依次点击屏幕"},
+    {"time": "11:10:15", "time_end": "11:10:17", "text": "我左手拿起桌上的黑色麦克风"},
+    {"time": "11:10:17", "time_end": "11:10:20", "text": "我拨动开关开启麦克风"}
   ],
   "others": [
-    {"time": "", "time_end": "", "text": "白衣女生双手接过手机，低头点击屏幕"}
+    {"time": "11:10:12", "time_end": "11:10:15", "text": "白衣女生双手握着手机低头点击屏幕"}
   ],
   "environment": "明亮的室内会议空间，长方形桌子铺着红白格子桌布，上有笔记本、手机、收纳包。背景有白板和补光灯。",
+  "env_changes": [
+    {"time": "11:10:10", "time_end": "11:10:11", "text": "手机从女生手中回到我手里", "cause": "other"},
+    {"time": "11:10:15", "time_end": "11:10:17", "text": "黑色麦克风离开桌面进入我左手", "cause": "self"},
+    {"time": "11:10:17", "time_end": "11:10:18", "text": "麦克风电源接通", "cause": "self"}
+  ],
   "speech": [
     {"lang": "zh", "speaker": "A1_JAKE", "text": "都戳一下，每人戳一下。"}
   ],
@@ -154,6 +190,10 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
     "emotion": "focused, neutral",
     "note": "作为协调者引导设备操作测试。"
   },
+  "causal_links": [
+    {"type": "other->action", "cause": "11:10:12 白衣女生轮流点击手机屏幕测试", "effect": "11:10:15 我拿起麦克风准备录音"},
+    {"type": "action->env", "cause": "11:10:17 我拨动开关", "effect": "11:10:18 麦克风电源接通"}
+  ],
   "ocr": [
     {"where": "whiteboard", "text": "日程安排\n1. 站会", "note": "handwriting"}
   ],
@@ -176,9 +216,12 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 `_p{N}` 后缀只在切分时（N>1）出现；不切分的片段（`--clip-duration 30` 或源视频 ≤ 目标时长）保持原 clip_id 无后缀。
 
 ### 字段说明
-- `self_actions` / `others`：`[{time, time_end, text}]`，`time` 为水印时间戳；无时间戳的行 `time=""` 但仍保留。
+- `self_actions` / `others`：`[{time, time_end, text}]`，`time` 为水印时间戳；无时间戳的行 `time=""` 但仍保留。**原子化**：一条 = 一个动词级步骤，复合行为拆开，无数量配额。
+- `environment`：整段一两句的**整体场景**（模拟器放置 agent 的上下文）；片段内的变化不写在这里。
+- `env_changes`：`[{time, time_end, text, cause}]`，片段内每次可观察的原子状态迁移；`cause ∈ {self, other, external}`（`external` = 无可见行为主体：自动门、天气、定时器）。
 - `speech`：`[{lang, speaker, text}]`，`lang ∈ {zh, en, ""}`。
 - `psychology`：`{awareness, emotion, note}`，缺失字段为空串。
+- `causal_links`：`[{type, cause, effect}]`，`type` 为 7 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；空数组合法（无可辩护的因果边时）。
 - `ocr`：`[{where, text, note}]`，**可选层**。`where ∈ {whiteboard, paper, screen, sign, other}`；`text` 为可读内容（尽量逐字）；`note` 可选（如"手写不清晰"）。**不 OCR 时间水印**。无可读文字表面时为 `[]`。
 - `narrative`：模型原始 JSON 全文（未解析），保完整以便人工核查/重新解析。
 - `clip_kind`：`30s`（不切分的标准源）/ `segment_open`（一天开头的不规则短段，如 `11094208`）/ `10s`/`15s`/`6s`/`5s`（切分片段）。`60s`（合并）已移除。
@@ -210,8 +253,8 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--base-url` | `https://api.xiaomimimo.com/v1` | |
 | `--api-key-env` | `MIMO_API_KEY` | 环境变量名 |
 | `--env-file` | None | `.env` 文件路径（默认搜索 CWD + 脚本目录） |
-| `--thinking` | `disabled` | `enabled` 时开推理（需调大 `--max-completion-tokens`；Mimo 会忽略 temperature） |
-| `--max-completion-tokens` | `1024` | thinking 时建议 8192（reasoning_tokens 共享此预算） |
+| `--thinking` | `enabled` | 推理模式。默认开——原子分解 + 状态追踪 + 因果推断都是推理密集任务。关掉省 ~4 倍成本/延迟，但 `causal_links` 质量明显下降（建议配套 `--max-completion-tokens 2048`）。thinking 下 Mimo 忽略 temperature |
+| `--max-completion-tokens` | `8192` | 完成预算由 reasoning tokens 与 JSON 正文共享；新 schema 正文 ~600-1500 tokens，thinking 下 8192 稳妥；关 thinking 时 2048 够用 |
 | `--no-json-mode` | off | 关闭 `response_format=json_object`（debug） |
 | **并发** | | |
 | `--max-rpm` | `90` | 全局 RPM 上限（Mimo 硬限 100，留余量） |
@@ -264,10 +307,13 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 
 - **60s 合并模式已移除**：实验显示模型处理 60s 视频时只描述前 5-6 秒（三组实验全部如此，非 token 限制）。
   `--clip-duration 60` 和 `concat_two_clips` 已删除。如未来找到让模型"看全"的 prompt 技巧，可考虑重新引入。
-- **thinking 成本高**：单片段实验中 thinking 把动作数从 3 提到 5（与 sectioned 持平），但
-  reasoning_tokens 占 84%，延迟 ×3-4。默认关，追求质量时手动开。
+- **thinking 默认开启、成本高**：原子分解 + 因果推断是推理密集任务，默认 `--thinking enabled --max-completion-tokens 8192`，
+  单次延迟/token 约 ×3-4（reasoning 占大头）。省钱跑法：`--thinking disabled --max-completion-tokens 2048`，
+  动作/环境层质量基本不变，`causal_links` 变稀疏且更浅。
+- **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，存疑则省"，
+  且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。
 - **JSON 模式偶发 code-fence**：极少数情况模型无视 `json_object` 模式仍输出 ` ```json ` 围栏或
-  sectioned 文本——解析器已兜底（剥围栏 / 回退 sectioned 解析），不影响可用性。
+  sectioned 文本——解析器已兜底（剥围栏 / 回退 sectioned 解析，含 `[Envchanges]`/`[Causal]` 节），不影响可用性。
 - **单 participant 单 day**：跨天/跨参与者需起多个进程，注意共享 RPM 配额（调低单进程 `--max-rpm`）。
 
 ---
@@ -276,14 +322,14 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 
 | 场景 | 推荐参数 |
 |---|---|
-| 标准跑（性价比最高） | 默认即可：`--max-rpm 90 --api-workers 6` |
-| 大批量、急 | `--max-rpm 95 --api-workers 8`（逼近配额，留意 429） |
-| 追求最高标注质量 | `--thinking enabled --max-completion-tokens 8192`（延迟/token ×4） |
+| 标准跑（因果标注质量优先） | 默认即可：`--max-rpm 90 --api-workers 6`（thinking on, 10s 切分） |
+| 大批量、预算敏感 | `--thinking disabled --max-completion-tokens 2048 --max-rpm 95 --api-workers 8`（放弃推理链，留意 429） |
 | 调试 prompt | `--limit 3 --api-workers 1`（串行，便于看日志） |
 
-**吞吐估算**：90 RPM ≈ 5400 clip/h。DAY1 ~828 段（~30s 源）在 `--clip-duration 10` 下
-≈ 2484 片段，理论 ~28 分钟（API 满载时）；切分在 API 等待间隙并行完成，不再是瓶颈。
-切分模式下每秒视频的 API 调用数约为 30s 模式的 3 倍，但单次更小且缓存命中更高（实测 ~73%）。
+**吞吐估算**：RPM 上限不变（90 RPM ≈ 5400 clip/h 的**调用数**上限），但 thinking 单次延迟 ×3-4、
+completion tokens ×~5-8，单日全量跑的 token 成本显著高于旧默认。DAY1 ~828 段（~30s 源）在
+`--clip-duration 10` 下 ≈ 2484 片段。切分在 API 等待间隙并行完成，不是瓶颈。
+system prompt 前缀缓存仍有效（实测旧版首次缓存命中 ~73%）。
 
 ---
 
@@ -302,4 +348,8 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 
 **结论**：默认 10s 在动作密度和拒绝率上明显占优；30s 在跨片段交互/语音上下文上更全。
 交互密集场景（会议、对话）可考虑 `--clip-duration 30` 或下游聚合相邻 10s caption。
-详见 `captions/_test/DAY4_10s/comparison_report.md`。
+
+> 注意：表中数量类指标（self_actions / 30s 等效等）基于**旧版 prompt**（数量建议制、无
+> 原子化要求）实测，仅供切分粒度对比参考；原子化 + causal_links 新版 prompt 下动作数
+> 会系统性偏高（复合行为被拆解），拒绝率也可能随输出变长而变化，待重新实测。
+> 详见 `captions/_test/DAY4_10s/comparison_report.md`。
