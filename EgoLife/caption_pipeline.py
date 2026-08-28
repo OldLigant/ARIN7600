@@ -3,12 +3,11 @@
 Turns first-person (Meta Aria) video segments into simulation-grade ATOMIC annotations
 for a life digital twin: self_actions / others / environment (overall scene) /
 env_changes (atomic state transitions, cause-attributed) / speech / psychology
-(emotion + awareness) / causal_links (directed env<->action<->emotion edges),
+(emotion) / causal_links (directed env<->action<->emotion edges, incl. env->env),
 plus optional OCR. The schema encodes the causal loop a simulator needs:
 emotion drives actions, actions mutate the environment, the environment feeds
-back into both actions and emotion. `awareness` grades the emotion->action edge;
-every `causal_links` edge carries a counterfactual `strength` (strong/moderate/weak)
-on the same ladder, so the causal graph is weighted, not just binary.
+back into both actions and emotion. Every `causal_links` edge carries a counterfactual
+`strength` (strong/moderate/weak), so the causal graph is weighted, not just binary.
 
 By default each ~30s source file is split into 3 x ~10s pieces and each piece is
 captioned independently (finer granularity, lower per-call rejection rate). Use
@@ -126,7 +125,7 @@ Use exactly this structure (fill every field; use empty arrays/strings when a se
   "speech": [
     {"lang": "zh", "speaker": "...", "text": "..."}
   ],
-  "psychology": {"awareness": "low", "emotion": "...", "note": "..."},
+  "psychology": {"emotion": "...", "note": "..."},
   "causal_links": [
     {"type": "env->action", "cause": "...", "effect": "...", "strength": "strong"}
   ],
@@ -147,6 +146,22 @@ honestly be 1-2 entries. Cover the whole clip span. Each "time"/"time_end" is a 
 HH:MM:SS (~1-3s resolution). Describe hand-object contact, posture, gaze, locomotion, device use.
 Use Chinese when the scene is Chinese-speaking. Never invent names for yourself; use neutral
 descriptors for others unless their name is shown or spoken.
+
+# Intent ban (CRITICAL)
+Never describe intent or future actions (准备 / 打算 / 想要 / 试图 to do X) unless X is actually
+observed within this clip. If the clip ends mid-activity, the last action simply ends there.
+Describe only what is visible: postures, contacts, movements — not goals. An unmade bed does
+NOT license "准备整理床铺" unless tidying is actually observed.
+
+# Object naming (anchoring, CRITICAL)
+Pick ONE stable label per object and reuse it for every mention in this clip (self_actions,
+others, env_changes, causal_links) — never rename the same object between entries. If an object
+cannot be confidently identified (too close / out of focus / partially occluded / reflective /
+covered by stickers), DO NOT guess a specific category: describe its observable attributes
+honestly (shape, size, color, material, transparency) — "一个贴有标签的半透明玻璃容器，距离过近
+细节模糊" is a CORRECT answer; confidently calling it "一块布" is a hallucination. Prioritize
+precision on NEAR-FIELD objects being touched / held / manipulated; distant background clutter
+may be summarized ("桌上散落多个包装盒与线缆").
 
 others: zero or more objects, same shape and same atomicity standard, timestamped the same way.
 Lead text with the person descriptor ("a woman in blue", "Shure"). Empty array if you are alone.
@@ -180,19 +195,11 @@ paper, a whiteboard/blackboard, a phone/laptop screen, a sign/poster, packaging,
 actually legible; do not invent. Do NOT OCR the top-right time watermark. Empty array [] if no
 notable text surface appears.
 
-psychology: an object with exactly:
-  awareness: "low" | "medium" | "high"  (required)
+psychology: an object with exactly (estimate the mental state AS IF THIS CLIP WERE YOUR ONLY
+EVIDENCE — ignore anything that might have happened before it; the question is "considering only
+this clip's situation, what would a plausible mental activity be?", state, not plans):
   emotion: one or two lowercase keywords (required; "neutral" if none readable)
   note: optional short sentence
-"awareness" measures how strongly emotion CAUSALLY drove visible behavior in this clip:
-  low    = emotion was background color; behavior was driven by habit or task, not by feeling.
-  medium = emotion colored HOW an action was performed (tone, pace, expression, vigor) but did not
-           change its direction.
-  high   = emotion directly triggered a behavior or a turn/pivot (e.g. embarrassment -> covering face).
-This is the SAME ladder as causal_links "strength" (low=weak, moderate=medium, high=strong):
-awareness must AGREE with any emotion->action causal_link you write (an edge graded "moderate"
-means awareness "medium"), and must be filled even when that edge is too weak to deserve its own
-causal_links entry (awareness "low" with no emotion->action edge is normal).
 "emotion" picks from: neutral calm relaxed bored focused amused happy excited surprised confused
 curious anxious nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
 When an environment event or another person is what moved your emotion, say so in "note" and also
@@ -204,13 +211,14 @@ One object per edge: {"type": "...", "cause": "<short phrase, prefix with HH:MM:
 Use EXACTLY these "type" strings:
   "env->action"     an environment event/state changed MY behavior (phone vibrates -> I pick it up).
   "env->emotion"    an environment event changed my emotion (loud noise -> startled/annoyed).
-  "emotion->action" my emotion directly drove my behavior (bored -> I start scrolling my phone);
-                    must agree with psychology.awareness (same ladder, see psychology).
+  "emotion->action" my emotion directly drove my behavior (bored -> I start scrolling my phone).
   "action->env"     my action changed the environment (I flip the switch -> lights turn on);
                     mirrors env_changes entries with cause "self".
   "other->action"   another person's action triggered my action (colleague waves me over -> I walk over).
   "other->env"      another person's action changed the environment (she opens the curtain -> room brightens).
   "other->emotion"  another person's action changed my emotion (guest laughs -> I relax).
+  "env->env"        an environmental event with NO visible agent causes another environmental
+                    change (云遮住阳光 -> 室内变暗; 风把门吹开).
 Every edge carries a REQUIRED "strength" grading how strongly the cause drove the effect,
 defined counterfactually:
   strong  = trigger: without this cause the effect likely would NOT have happened, or would have
@@ -248,7 +256,7 @@ USER_TASK_TMPL = (
     "Decompose what happens into ATOMIC actions and ATOMIC environment state changes — there is NO "
     "count quota; atomicity is the standard. Then record every causal edge you can defend from the "
     "clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
-    "other->env, other->emotion — each graded strength strong/moderate/weak by how strongly the "
+    "other->env, other->emotion, env->env — each graded strength strong/moderate/weak by how strongly the "
     "cause drove the effect."
 )
 
@@ -425,11 +433,10 @@ _ANNOTATION_SCHEMA = {
         "psychology": {
             "type": "object",
             "properties": {
-                "awareness": {"type": "string", "enum": ["low", "medium", "high"]},
                 "emotion": {"type": "string"},
                 "note": {"type": "string"},
             },
-            "required": ["awareness", "emotion"],
+            "required": ["emotion"],
         },
         # causal_links items are normalized leniently in _norm_causal (invalid/missing
         # strength -> ""), so a stray value on one edge never rejects the whole response.
@@ -514,16 +521,13 @@ def _parse_speech(lines: list) -> list:
 
 
 def _parse_psychology(lines: list) -> dict:
-    psych = {"awareness": "", "emotion": "", "note": ""}
+    psych = {"emotion": "", "note": ""}
     for ln in lines:
         ln = _strip_bullet(ln)
         if not ln:
             continue
         low = ln.lower()
-        if low.startswith("awareness"):
-            val = ln.split(":", 1)[-1].strip().lower().strip("`*")
-            psych["awareness"] = val.split()[0] if val else ""
-        elif low.startswith("emotion"):
+        if low.startswith("emotion"):
             psych["emotion"] = ln.split(":", 1)[-1].strip().lower().strip("`*")
         elif low.startswith("note"):
             psych["note"] = ln.split(":", 1)[-1].strip()
@@ -557,11 +561,9 @@ def _parse_ocr(lines: list) -> list:
 
 
 _CAUSAL_TYPES = ("env->action", "env->emotion", "emotion->action", "action->env",
-                 "other->action", "other->env", "other->emotion")
-# Edge strength shares one ladder with psychology.awareness (weak/moderate/strong == low/medium/high).
+                 "other->action", "other->env", "other->emotion", "env->env")
+# Edge strength grades each causal link counterfactually (weak/moderate/strong).
 _STRENGTH_LEVELS = ("strong", "moderate", "weak")
-_STRENGTH_RANK = {"": 0, "weak": 1, "moderate": 2, "strong": 3}
-_AWARENESS_RANK = {"low": 1, "medium": 2, "high": 3}
 
 
 def _parse_causal(lines: list) -> list:
@@ -590,21 +592,6 @@ def _parse_causal(lines: list) -> list:
                 break
         out.append({"type": typ, "cause": cause, "effect": effect, "strength": strength})
     return out
-
-
-def _check_awareness_consistency(layered: dict, clip_id: str) -> None:
-    """Warn (not fail) when an emotion->action edge is graded stronger than
-    psychology.awareness — they are supposed to share one ladder."""
-    edges = [e.get("strength", "") for e in layered.get("causal_links") or []
-             if e.get("type") == "emotion->action"]
-    if not edges:
-        return
-    strongest = max(edges, key=lambda s: _STRENGTH_RANK.get(s, 0))
-    awareness = (layered.get("psychology") or {}).get("awareness", "")
-    if _STRENGTH_RANK.get(strongest, 0) > _AWARENESS_RANK.get(awareness, 0):
-        logging.getLogger("caption_pipeline").warning(
-            f"[{clip_id}] awareness '{awareness}' understates emotion->action edge strength "
-            f"'{strongest}' (same ladder: low/medium/high == weak/moderate/strong)")
 
 
 def parse_layered_caption(text: str) -> dict:
@@ -657,8 +644,8 @@ def parse_json_caption(content: str) -> dict:
             raise ParseFailed(f"schema: {e}", content)
     else:
         psych = data.get("psychology")
-        if not (isinstance(psych, dict) and psych.get("awareness") in ("low", "medium", "high")):
-            raise ParseFailed("psychology.awareness missing or invalid", content)
+        if not (isinstance(psych, dict) and psych.get("emotion")):
+            raise ParseFailed("psychology.emotion missing or invalid", content)
         if not isinstance(data.get("self_actions"), list):
             raise ParseFailed("self_actions not array", content)
 
@@ -702,8 +689,7 @@ def parse_json_caption(content: str) -> dict:
         "environment": str(data.get("environment", "") or ""),
         "env_changes": [_norm_env_change(e) for e in data.get("env_changes", []) or []],
         "speech": [_norm_speech(s) for s in data.get("speech", []) or []],
-        "psychology": {"awareness": str(psych.get("awareness", "") or ""),
-                       "emotion": str(psych.get("emotion", "") or ""),
+        "psychology": {"emotion": str(psych.get("emotion", "") or ""),
                        "note": str(psych.get("note", "") or "")},
         "causal_links": [_norm_causal(c) for c in data.get("causal_links", []) or []],
         "ocr": [_norm_ocr(o) for o in data.get("ocr", []) or []],
@@ -726,7 +712,7 @@ def classify_output(content: str, out_tokens: int) -> str:
     if out_tokens <= 25:
         stripped = content.strip()
         has_structure = (stripped.startswith("{") or "[Self]" in stripped
-                         or "awareness" in stripped.lower() or '"psychology"' in stripped)
+                         or "emotion" in stripped.lower() or '"psychology"' in stripped)
         if not has_structure:
             return OUTCOME_SAFETY
     return OUTCOME_OK
@@ -754,9 +740,9 @@ class CaptionRecord:
     environment: str = ""        # overall scene backdrop (simulator context), not a changelog
     env_changes: list = None     # [{time, time_end, text, cause}] — atomic state transitions
     speech: list = None          # [{lang, speaker, text}]
-    psychology: dict = None      # {awareness, emotion, note} — awareness grades emotion->action
+    psychology: dict = None      # {emotion, note} — emotion graded via causal_links strength
     causal_links: list = None    # [{type, cause, effect, strength}] — strength-graded directed
-                                  # env<->action<->emotion edges (strength ~ awareness ladder)
+                                  # env<->action<->emotion/env edges
     ocr: list = None             # [{where, text, note}]  (optional layer; empty if no text surface)
     clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
     output_format: str = "json"  # "json" | "fallback_sectioned"
@@ -847,8 +833,6 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         else:
             return None, UsageRecord(clip_id, gid, attempt, round(latency, 3),
                                      OUTCOME_PARSE_FAILED, usage, content)
-
-    _check_awareness_consistency(layered, clip_id)
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     recovery = "fallback_sectioned" if output_format == "fallback_sectioned" else "ok"
