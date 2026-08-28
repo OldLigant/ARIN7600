@@ -1304,9 +1304,9 @@ def main():
     # --- Concurrency ---
     ap.add_argument("--max-rpm", type=int, default=90, help="global RPM cap (Mimo limit is 100)")
     ap.add_argument("--api-workers", type=int, default=None,
-                    help="API worker threads (default: max(--max-rpm/2, 20) — thinking-mode "
-                         "requests take ~30s+ each, so ~2 requests/min per worker and rpm/2 "
-                         "in-flight workers saturate the RPM cap)")
+                    help="API worker threads (default: min(--max-rpm/2, 20) — thinking-mode "
+                         "requests take ~30s+ each, so ~2 requests/min per worker; scales with "
+                         "--max-rpm but caps at 20 to keep one machine's connections modest)")
     ap.add_argument("--preprocess-workers", type=int, default=2)
     # --- Flow ---
     ap.add_argument("--skip-preprocess", action="store_true",
@@ -1320,10 +1320,10 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="only process first N clips (debug)")
     args = ap.parse_args()
 
-    # Thinking-mode requests run ~30s+, so each worker only completes ~2 requests/min:
-    # rpm/2 workers saturate the RPM cap; the floor of 20 guards slower networks.
+    # Thinking-mode requests run ~30s+; scale workers with the RPM cap but cap at
+    # 20 so a single machine doesn't open excessive connections.
     if args.api_workers is None:
-        args.api_workers = max(args.max_rpm // 2, 20)
+        args.api_workers = min(args.max_rpm // 2, 20)
 
     # --- Load API key ---
     env_paths = []
