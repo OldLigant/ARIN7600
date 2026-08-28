@@ -99,7 +99,6 @@ AUDIO_SAMPLE_RATE = 48000
 IMG_CACHE_NAME = f"img1024_f{SCENE_FRAME_COUNT}"
 AUDIO_CACHE_NAME = f"audio{int(SCENE_DURATION_S)}"
 
-MAX_COMPLETION_TOKENS = 1024
 THINKING_DEFAULT = "disabled"
 
 # ===========================================================================
@@ -525,7 +524,7 @@ def run_probe(args, client, log):
     """Process scene 0 only, print the raw model output, attempt to parse it.
     Returns 0 on success, non-zero on failure. Does NOT write to the main output."""
     log.info("=== PROBE MODE: scene 0 only ===")
-    cfg = ApiCallConfig(args.thinking, args.max_completion_tokens, not args.no_json_mode)
+    cfg = ApiCallConfig(args.thinking, not args.no_json_mode)
     limiter = SlidingWindowRateLimiter(args.max_rpm)
 
     data_dir = args.data_dir
@@ -614,7 +613,6 @@ def main():
     ap.add_argument("--env-file", type=Path, default=None,
                     help=".env file to load MIMO_API_KEY from (default: search CWD + script dir + EgoLife/)")
     ap.add_argument("--thinking", default=THINKING_DEFAULT, choices=["enabled", "disabled"])
-    ap.add_argument("--max-completion-tokens", type=int, default=MAX_COMPLETION_TOKENS)
     ap.add_argument("--no-json-mode", action="store_true")
     # --- Concurrency ---
     ap.add_argument("--max-rpm", type=int, default=90)
@@ -698,7 +696,7 @@ def main():
         sys.exit(run_probe(args, client, log))
 
     json_mode = not args.no_json_mode
-    cfg = ApiCallConfig(args.thinking, args.max_completion_tokens, json_mode)
+    cfg = ApiCallConfig(args.thinking, json_mode)
     log.info(f"data_dir={args.data_dir} model={args.model} thinking={args.thinking} "
              f"json_mode={json_mode} resolution={args.resolution}")
     log.info(f"output: {out_file}")
@@ -898,7 +896,6 @@ def main():
     summary = {
         "model": args.model, "dataset": "AriaRealLife/test",
         "data_dir": str(args.data_dir), "thinking": args.thinking, "json_mode": json_mode,
-        "max_completion_tokens": args.max_completion_tokens,
         "max_rpm": args.max_rpm, "api_workers": args.api_workers,
         "preprocess_workers": args.preprocess_workers,
         "skip_preprocess": args.skip_preprocess, "skip_existing": args.skip_existing,

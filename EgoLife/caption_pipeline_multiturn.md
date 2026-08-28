@@ -172,12 +172,12 @@ ffmpeg/限速/OrderedWriter 基础设施），输出 schema 见 §7 的字段变
   `--t1c-frame-fps`（默认 1）、`--t1c-frame-size`（长边上限 px，0=原生）。
 - **可替换 VLM 接口**：读屏只需要视觉、不需要音频/全模态——T1c 支持 `--t1c-provider
   custom`（配 `--t1c-base-url` / `--t1c-model` / `--t1c-api-key-env`）接入任意 OpenAI 兼容
-  图像模型（走 `max_tokens`、无 thinking 参数、仍要求 JSON 输出；不支持 json_object 的模型
+  图像模型（不传 completion 上限、无 thinking 参数、仍要求 JSON 输出；不支持 json_object 的模型
   加 `--t1c-no-json-mode`）；默认走 MiMO。实测候补：DeepSeek `deepseek-v4-flash-vision-exp`
   （OpenAI 兼容、base64 image_url、单请求 ≤600 图、**每图 token ≤384 封顶**——30 帧输入
-  ≤11.5k token，约为 MiMO 原生帧的 1/5，且不占 Mimo 配额。注意它是**推理型视觉模型**：
-  `max_tokens` 必须给足——2048 时视觉推理阶段烧光预算、JSON 正文不出现，DAY4 实测 48/48
-  失败全部恰好触顶；配 `--t1c-max-completion-tokens 8192`）。
+  ≤11.5k token，约为 MiMO 原生帧的 1/5，且不占 Mimo 配额。注意它是**推理型视觉模型**，
+  视觉推理阶段会烧大量 completion token——历史上固定 2048 上限时 JSON 正文不出现（DAY4
+  实测 48/48 失败恰好触顶）；管线已不再传上限，接入前确认供应商默认预算足够）。
 - **任务**：不止 OCR，是 **GUI 语义理解**——这是什么应用/网站、正在操作什么内容：
 
 | 场景 | 期望输出 |
@@ -681,8 +681,8 @@ captions/A1_JAKE/DAY1/
 - **thinking 分轮**：T1 / T1c 关（纯感知，且 T1 本来要跑 k 次）；T2 / T3 / T4 开（原子分解
   与因果推断是推理密集任务）。**reasoning_content 无需回传**：每轮都是独立单发会话（无
   assistant 历史），官方文档确认只有"历史含工具调用"时才强制回传 reasoning_content（否则
-  400），纯文本/无历史场景不传完全合规——本设计天然满足。`max_completion_tokens` 覆盖
-  思考+正文（沿用旧结论，8192 稳妥）。
+  400），纯文本/无历史场景不传完全合规——本设计天然满足。不传 completion 上限，由服务端按
+  最大补全预算执行。
 - **成本大头是输入 token、尤其是视频 token——消息布局为缓存命中而设计**（§6.0）：输入
   1元/M、缓存命中 0.02元/M（**1/50**）、输出 2元/M。每片段 4-5 次视频调用 × ~6-7k token/
   次是费用主体；前缀一旦命中，这部分就从 1元/M 变 0.02元/M——**相当于把成本大头砍掉 ~98%**，

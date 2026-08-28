@@ -120,7 +120,7 @@ pip install openai pandas python-dotenv jsonschema
 python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
 
 # 省成本/提速 ~4 倍（无推理链；动作/环境层照常，causal_links 质量明显下降）
-python caption_pipeline.py --participant A1_JAKE --day 1 --thinking disabled --max-completion-tokens 2048
+python caption_pipeline.py --participant A1_JAKE --day 1 --thinking disabled
 
 # 不切分：一段源视频（~30s）一个 caption（旧行为）
 python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
@@ -268,8 +268,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--base-url` | `https://api.xiaomimimo.com/v1` | |
 | `--api-key-env` | `MIMO_API_KEY` | 环境变量名 |
 | `--env-file` | None | `.env` 文件路径（默认搜索 CWD + 脚本目录） |
-| `--thinking` | `enabled` | 推理模式。默认开——原子分解 + 状态追踪 + 因果推断都是推理密集任务。关掉省 ~4 倍成本/延迟，但 `causal_links` 质量明显下降（建议配套 `--max-completion-tokens 2048`）。thinking 下 Mimo 忽略 temperature |
-| `--max-completion-tokens` | `8192` | 完成预算由 reasoning tokens 与 JSON 正文共享；新 schema 正文 ~600-1500 tokens，thinking 下 8192 稳妥；关 thinking 时 2048 够用 |
+| `--thinking` | `enabled` | 推理模式。默认开——原子分解 + 状态追踪 + 因果推断都是推理密集任务。关掉省 ~4 倍成本/延迟，但 `causal_links` 质量明显下降。thinking 下 Mimo 忽略 temperature |
 | `--no-json-mode` | off | 关闭 `response_format=json_object`（debug） |
 | **并发** | | |
 | `--max-rpm` | `90` | 全局 RPM 上限（Mimo 硬限 100，留余量） |
@@ -322,8 +321,8 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 
 - **60s 合并模式已移除**：实验显示模型处理 60s 视频时只描述前 5-6 秒（三组实验全部如此，非 token 限制）。
   `--clip-duration 60` 和 `concat_two_clips` 已删除。如未来找到让模型"看全"的 prompt 技巧，可考虑重新引入。
-- **thinking 默认开启、成本高**：原子分解 + 因果推断是推理密集任务，默认 `--thinking enabled --max-completion-tokens 8192`，
-  单次延迟/token 约 ×3-4（reasoning 占大头）。省钱跑法：`--thinking disabled --max-completion-tokens 2048`，
+- **thinking 默认开启、成本高**：原子分解 + 因果推断是推理密集任务，默认 `--thinking enabled`，
+  单次延迟/token 约 ×3-4（reasoning 占大头）。省钱跑法：`--thinking disabled`，
   动作/环境层质量基本不变，`causal_links` 变稀疏且更浅。
 - **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，怀疑边存在才省略"，
   且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。`strength` 是模型的主观三档
@@ -339,7 +338,7 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 | 场景 | 推荐参数 |
 |---|---|
 | 标准跑（因果标注质量优先） | 默认即可：`--max-rpm 90 --api-workers 6`（thinking on, 10s 切分） |
-| 大批量、预算敏感 | `--thinking disabled --max-completion-tokens 2048 --max-rpm 95 --api-workers 8`（放弃推理链，留意 429） |
+| 大批量、预算敏感 | `--thinking disabled --max-rpm 95 --api-workers 8`（放弃推理链，留意 429） |
 | 调试 prompt | `--limit 3 --api-workers 1`（串行，便于看日志） |
 
 **吞吐估算**：RPM 上限不变（90 RPM ≈ 5400 clip/h 的**调用数**上限），但 thinking 单次延迟 ×3-4、

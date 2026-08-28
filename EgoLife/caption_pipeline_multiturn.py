@@ -62,8 +62,6 @@ ROOT = Path(__file__).resolve().parent
 # ===========================================================================
 
 DEFAULT_VOTES = 2
-MAX_TOKENS_T234 = 8192     # thinking rounds (T2/T3/T4): budget shared by reasoning+body
-MAX_TOKENS_T1 = 2048       # perception rounds run with thinking disabled
 NATIVE_FRAME_FPS = 1.0     # T1c keyframe sampling (~1 frame/sec, native resolution)
 
 DEFAULT_RESOLUTION = 1024
@@ -720,28 +718,25 @@ def clip_header(row) -> str:
 # ===========================================================================
 
 class TurnApiConfig:
-    __slots__ = ("thinking", "max_completion_tokens", "json_mode")
+    __slots__ = ("thinking", "json_mode")
 
-    def __init__(self, thinking, max_completion_tokens, json_mode=True):
+    def __init__(self, thinking, json_mode=True):
         self.thinking = thinking
-        self.max_completion_tokens = max_completion_tokens
         self.json_mode = json_mode
 
 
 def _raw_call(client, model, messages, cfg, limiter, tag, log, api_style="mimo") -> tuple:
     """One HTTP call (network-level retry x2). Returns (content, usage, latency, attempt).
-    api_style "mimo": thinking extra_body + max_completion_tokens. api_style "openai":
-    generic OpenAI-compatible VLM (T1c plug-in) — max_tokens, no vendor-specific body."""
+    api_style "mimo": thinking extra_body, no completion cap (server default = max).
+    api_style "openai": generic OpenAI-compatible VLM (T1c plug-in) — no vendor body."""
     last_exc = None
     if api_style == "mimo":
         kwargs = dict(model=model, messages=messages,
-                      max_completion_tokens=cfg.max_completion_tokens,
                       extra_body={"thinking": {"type": cfg.thinking}})
         if cfg.thinking == "disabled":
             kwargs["temperature"] = 1.0
     else:
-        kwargs = dict(model=model, messages=messages,
-                      max_tokens=cfg.max_completion_tokens, temperature=1.0)
+        kwargs = dict(model=model, messages=messages, temperature=1.0)
     if cfg.json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     for attempt in range(1, 3):
@@ -1563,10 +1558,6 @@ def main():
                          "types (QC flags them) but runs ~3x faster")
     ap.add_argument("--t1-thinking", default="disabled", choices=["enabled", "disabled"],
                     help="thinking for T1/T1c perception rounds (k votes each anyway)")
-    ap.add_argument("--max-completion-tokens", type=int, default=MAX_TOKENS_T234,
-                    help="completion budget for T2/T3/T4")
-    ap.add_argument("--t1-max-completion-tokens", type=int, default=MAX_TOKENS_T1,
-                    help="completion budget for T1/T1c")
     # --- Multiturn-specific ---
     ap.add_argument("--votes", type=int, default=DEFAULT_VOTES,
                     help="T1 independent perception runs per clip (spec: k=2 + arbitration)")
@@ -1596,12 +1587,6 @@ def main():
                     help="omit response_format=json_object for the custom T1c provider "
                          "(use if it rejects json_object, e.g. some vision models; the "
                          "prompt already demands JSON and parsing is tolerant)")
-    ap.add_argument("--t1c-max-completion-tokens", type=int, default=None,
-                    help="completion budget for T1c (default: --t1-max-completion-tokens). "
-                         "Raise to 8192 for reasoning vision models (e.g. DeepSeek "
-                         "v4-flash-vision-exp): with 2048 the visual-reasoning phase eats "
-                         "the whole budget and the JSON body never appears (48/48 failures "
-                         "in the DAY4 v3 run hit the cap exactly)")
     # --- Concurrency ---
     ap.add_argument("--max-rpm", type=int, default=90, help="global RPM cap")
     ap.add_argument("--api-workers", type=int, default=6)
@@ -1700,22 +1685,17 @@ def main():
              f"time={args.start_time or '00:00'}-{args.end_time or '23:59'} "
              f"clip_duration={args.clip_duration}s votes={args.votes} "
              f"turns={sorted(args.turns_expanded)} t4_video={args.t4_video}")
-    log.info(f"model={args.model} thinking(t2-4)={args.thinking} thinking(t1)={args.t1_thinking} "
-             f"max_tokens(t2-4)={args.max_completion_tokens} max_tokens(t1)={args.t1_max_completion_tokens}")
+    log.info(f"model={args.model} thinking(t2-4)={args.thinking} thinking(t1)={args.t1_thinking}")
     log.info(f"output: {out_file}")
 
     # --- Turn configs / stores / client ---
     cfgs = {
-        "t1": TurnApiConfig(args.t1_thinking, args.t1_max_completion_tokens),
-        # merge must re-emit the full lexicon + transcript: 2048 truncated it in
-        # the first smoke run (out hit the cap exactly, JSON cut mid-string)
-        "t1m": TurnApiConfig(args.t1_thinking, max(4096, args.t1_max_completion_tokens)),
-        "t1c": TurnApiConfig(args.t1_thinking,
-                             args.t1c_max_completion_tokens or args.t1_max_completion_tokens,
-                             json_mode=not args.t1c_no_json_mode),
-        "t2": TurnApiConfig(args.thinking, args.max_completion_tokens),
-        "t3": TurnApiConfig(args.thinking, args.max_completion_tokens),
-        "t4": TurnApiConfig(args.t4_thinking or args.thinking, args.max_completion_tokens),
+        "t1": TurnApiConfig(args.t1_thinking),
+        "t1m": TurnApiConfig(args.t1_thinking),
+        "t1c": TurnApiConfig(args.t1_thinking, json_mode=not args.t1c_no_json_mode),
+        "t2": TurnApiConfig(args.thinking),
+        "t3": TurnApiConfig(args.thinking),
+        "t4": TurnApiConfig(args.t4_thinking or args.thinking),
     }
     stores = {t: TurnStore(captions_dir / f"{stem}_{t}.jsonl") for t in _TURN_NAMES}
     stores["_usage"] = TurnStore(usage_path)

@@ -30,7 +30,7 @@ Usage
   python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
   # cheaper/faster: no reasoning chain (action/env layers still fine, causal
   # links get noticeably weaker)
-  python caption_pipeline.py --thinking disabled --max-completion-tokens 2048
+  python caption_pipeline.py --thinking disabled
   # legacy: one caption per 30s source file (no splitting)
   python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
   # time-windowed
@@ -81,7 +81,6 @@ ROOT = Path(__file__).resolve().parent  # .../ARIN7600/EgoLife/
 # Constants & prompt
 # ===========================================================================
 
-MAX_COMPLETION_TOKENS = 8192       # thinking shares this budget with the JSON body
 THINKING_DEFAULT = "enabled"       # causal-graph annotation is reasoning-heavy; disable for ~4x speedup
 
 # ffmpeg re-encode defaults (1024x1024 @ 2fps is the validated sweet spot:
@@ -981,11 +980,10 @@ def count_pieces_for_units(units, log=None) -> list[int]:
 # ===========================================================================
 
 class ApiCallConfig:
-    __slots__ = ("thinking", "max_completion_tokens", "json_mode")
+    __slots__ = ("thinking", "json_mode")
 
-    def __init__(self, thinking, max_completion_tokens, json_mode):
+    def __init__(self, thinking, json_mode):
         self.thinking = thinking
-        self.max_completion_tokens = max_completion_tokens
         self.json_mode = json_mode
 
 
@@ -1092,7 +1090,6 @@ def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg):
     temperature (Mimo forces its own defaults under deep thinking)."""
     last_exc = None
     kwargs = dict(model=model, messages=messages,
-                  max_completion_tokens=cfg.max_completion_tokens,
                   extra_body={"thinking": {"type": cfg.thinking}})
     if cfg.thinking == "disabled":
         kwargs["temperature"] = 1.0
@@ -1380,13 +1377,9 @@ def main():
                     help=".env file to load MIMO_API_KEY from (default: search CWD + script dir)")
     ap.add_argument("--thinking", default=THINKING_DEFAULT, choices=["enabled", "disabled"],
                     help="reasoning mode (default: enabled — causal-graph annotation is "
-                         "reasoning-heavy). Use --thinking disabled --max-completion-tokens 2048 "
+                         "reasoning-heavy). Use --thinking disabled "
                          "for ~4x cheaper/faster runs (causal_links quality drops). "
                          "Under thinking Mimo ignores temperature/top_p.")
-    ap.add_argument("--max-completion-tokens", type=int, default=MAX_COMPLETION_TOKENS,
-                    help="completion budget shared by reasoning tokens and the JSON body. "
-                         "8192 fits thinking + the enriched schema; 2048 suffices with "
-                         "--thinking disabled.")
     ap.add_argument("--no-json-mode", action="store_true",
                     help="disable response_format=json_object (debug; falls back to sectioned parser)")
     # --- Concurrency ---
@@ -1477,13 +1470,12 @@ def main():
         sh.setFormatter(fmt); log.addHandler(sh)
 
     json_mode = not args.no_json_mode
-    cfg = ApiCallConfig(args.thinking, args.max_completion_tokens, json_mode)
+    cfg = ApiCallConfig(args.thinking, json_mode)
     log.info(f"participant={args.participant} day={args.day} "
              f"time={args.start_time or '00:00'}-{args.end_time or '23:59'} "
              f"clip_duration={args.clip_duration}s src_root={src_root} "
              f"-> {src_root / args.participant / f'DAY{args.day}'}")
-    log.info(f"model={args.model} thinking={args.thinking} "
-             f"max_completion_tokens={args.max_completion_tokens} json_mode={json_mode}")
+    log.info(f"model={args.model} thinking={args.thinking} json_mode={json_mode}")
     log.info(f"output: {out_file}")
 
     # --- Decide clip rows / units ---
@@ -1727,7 +1719,6 @@ def main():
         "model": args.model, "participant": args.participant, "day": args.day,
         "time_range": {"start": args.start_time, "end": args.end_time},
         "clip_duration": args.clip_duration, "thinking": args.thinking, "json_mode": json_mode,
-        "max_completion_tokens": args.max_completion_tokens,
         "temperature": (1.0 if args.thinking == "disabled" else None),
         "max_rpm": args.max_rpm, "api_workers": args.api_workers,
         "preprocess_workers": args.preprocess_workers,
