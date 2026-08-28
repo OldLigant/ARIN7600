@@ -1,7 +1,7 @@
 # caption_pipeline — EgoLife 原子化结构化行为标注
 
 > 用 Mimo-V2.5 全模态模型，把第一人称（Meta Aria）视频段标注成**面向数字孪生/模拟的原子化结构化 JSON**：
-> 自身动作 / 他人动作 / 整体环境 / 环境原子变化 / 语音 / 心理（`awareness` 情绪-行为驱动力评级）/ 因果边 `causal_links`（带 `strength` 三档强度）/ OCR（可选）。
+> 环境（setting + 近场物体 + background）/ 人物表 / 自身动作 / 他人动作 / 环境原子变化 / 语音 / 声音 / 界面（屏幕页面理解）/ 心理（emotion + `mental_activity`）/ 因果边 `causal_links`（带 `strength` 三档强度）。
 > 单文件自包含，不依赖兄弟模块。
 >
 > **核心思想**：情绪驱动动作，动作改变环境，环境反过来影响动作与情绪——`causal_links` 显式记录这张**带强度权重**的有向因果图。
@@ -15,18 +15,20 @@
 
 输入：EgoLife 第一人称视频（参与者戴着 Meta Aria 眼镜录制），默认按 10s 切分。
 
-输出：一个 JSON 对象，包含 8 个层：
+输出：一个 JSON 对象，包含 10 个层：
 
 | 层 | 字段 | 内容 | 时间戳 |
 |---|---|---|---|
-| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤） | ✅ 读视频右上角水印 `HH:MM:SS:FF`，标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率） |
-| **他人行为** | `others` | 其他人做了什么；中立称呼（"穿粉色上衣的女性"），不臆造名字；同样原子化 | ✅ 同一时间轴 |
-| **环境（整体）** | `environment` | 整体场景背景：地点类型、布局、光照、天气/室内外——模拟器放置 agent 的上下文，是"场景说明"而非"变化日志" | ❌（整段一两句） |
-| **环境变化** | `env_changes` | 片段内可观察的**原子状态迁移**：物体出现/消失/移动、设备状态改变（屏幕亮/灭、门开、瓶盖拧开）、光线变化、人进出画面；`cause ∈ {self, other, external}` 归因 | ✅ 同一时间轴 |
-| **语音** | `speech` | 关键话语；`lang` + 说话人 + 引号文本 | ❌（模型音视不严格对齐，不强求） |
-| **心理** | `psychology` | `awareness` 等级 + `emotion` 分类 + 可选 `note` | 整段一个 |
-| **因果边** | `causal_links` | 有向因果边 `{type, cause, effect, strength}`，7 种类型见下 | cause/effect 短语内嵌时间 |
-| **OCR（可选）** | `ocr` | 纸/白板/屏幕/招牌上**大量可读文字**时才填；`{where, text, note}`。不填默认 `[]`。**不 OCR 水印。** | ❌ |
+| **环境（整体）** | `environment` | `{setting, near_field[], background}`：整体场景说明 + **近场物体清单**（我/他人可能交互的东西，模拟器据此 spawn 道具）+ 其余背景一笔。near_field 的物体标签即全片段唯一命名（对象锚定，识别不了就如实描述外观，不猜类别）；场景说明而非变化日志 | ❌（整段） |
+| **人物表** | `people` | 画面中出现的**其他人**花名册（不含自己）：`{id: "P1", descriptor, name, note}`；id 与 descriptor 全片段复用；`name` 仅当场说出/显示才填，不臆造 | ❌ |
+| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤）；只写可观察动作——意图只能进 psychology | ✅ 读视频**左上角**水印 `HH:MM:SS:FF`，标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率）；视频按 2fps 采样，**按水印读时间、严禁数帧推算**，帧间跳变不臆补中间微步 |
+| **他人行为** | `other_actions` | 其他人做了什么；同原子化标准，`person` 字段引用 people.id，文本以 descriptor 开头 | ✅ 同一时间轴 |
+| **环境变化** | `env_changes` | 片段内可观察的**原子状态迁移**：物体出现/消失/移动、设备状态改变（屏幕亮/灭、门开、瓶盖拧开）、光线变化、人进出画面；`cause ∈ {self, other, external}` 归因（other 时文中点名人物 id） | ✅ 同一时间轴 |
+| **语音** | `speech` | 关键话语；`lang` + 说话人（`self` 或 people.id，听不清时短描述）+ 引号文本 | ❌（音视不严格对齐，不强求） |
+| **声音** | `sound` | 离散**非语音**声音：提示音、铃声、键盘、门响、脚步、笑声咳嗽等；`{time?, text, source}`——仅当时刻可被画面锚定（手机亮屏同时响）才标 time；持续环境音写进 environment | ⚠️ 可选（视觉锚定时才有 time） |
+| **界面** | `interface` | **条件触发**：画面出现屏幕（手机/笔记本/电视…）或大量可读文字表面（白板/纸/招牌）才填。屏幕不止 OCR：识别 app/网站 + 页面类型 + 关键可见内容（bilibili 标题+UP主、知乎问题+回答、文件管理器路径文件名、聊天最新消息…）；内容中途变化时新增带 time 的条目。**不转写时间水印。** | ✅（页面变化时标 time） |
+| **心理** | `psychology` | `{emotion, mental_activity}`，仅凭本片段推断（当作唯一证据）；`mental_activity` 是**全 schema 唯一允许出现意图/计划**的字段（第一人称正在想什么、接下来要做什么），无线索时如实写"无特别线索" | 整段一个 |
+| **因果边** | `causal_links` | 有向因果边 `{type, cause, effect, strength}`，8 种类型见下 | cause/effect 短语内嵌时间 |
 
 ### 原子化原则（取代数量配额）
 
@@ -45,22 +47,25 @@
 ```
 emotion ──emotion->action──> self_actions ──action->env──> env_changes
    ▲   └──other->emotion──┐      ▲                            │
-   │                      │      └──other->action── others ───┤
+   │                      │      └──other->action── other_ ───┤
+   │                      │                actions           │
    └────env->emotion──────┴───────────────────────────────────┘
    └────env->action───────────────────────────────────────────┘
+   └────env->env（环境事件引发另一环境变化，如空调启动→纸张吹动）──┘
 ```
 
-7 种边类型（`type` 字段取值，ASCII 写法）：
+8 种边类型（`type` 字段取值，ASCII 写法）：
 
 | type | 含义 | 例子 |
 |---|---|---|
 | `env->action` | 环境事件改变我的行为 | 手机震动 → 我拿起手机 |
 | `env->emotion` | 环境事件改变我的情绪 | 巨响 → 受惊/烦躁 |
-| `emotion->action` | 我的情绪直接驱动行为 | 无聊 → 开始刷手机；须与 `awareness` 同档一致（同一阶梯） |
+| `emotion->action` | 我的情绪直接驱动行为 | 无聊 → 开始刷手机 |
 | `action->env` | 我的动作改变环境 | 我拨开关 → 灯亮；与 `cause="self"` 的 `env_changes` 互为镜像 |
 | `other->action` | 他人动作触发我的动作 | 同事招手 → 我走过去 |
 | `other->env` | 他人动作改变环境 | 她拉开窗帘 → 房间变亮 |
 | `other->emotion` | 他人动作改变我的情绪 | 客人笑了 → 我放松 |
+| `env->env` | 环境事件引发另一环境变化 | 空调启动 → 桌上纸张被吹动 |
 
 每条边带**必填的 `strength`** 三档强度（反事实定义——"没有这个因，果还会发生吗"）：
 
@@ -74,26 +79,20 @@ emotion ──emotion->action──> self_actions ──action->env──> env_c
 **omit 的语义收紧为"怀疑这条边存在"**——真实但微弱的影响用 `weak` 如实记录，而不是丢弃；
 存在性、强度两个维度就此分开。
 
-各层在模拟中的角色：`self_actions` = agent 的控制输入（动作空间），`env_changes` = 环境状态转移（转移函数监督信号），`environment` = 初始场景上下文，`emotion` = 内部状态，`causal_links` = 因果图的**加权**边，`awareness` = emotion→action 边的强度摘要（与 `strength` 同一阶梯）。
+各层在模拟中的角色：`self_actions` = agent 的控制输入（动作空间），`env_changes` = 环境状态转移（转移函数监督信号），`environment` = 要 spawn 的初始场景（含近场道具清单），`people` = 场景 NPC 花名册，`psychology` = 内部状态（含意图），`causal_links` = 因果图的**加权**边。
 
 **有意的冗余**："我拿起杯子"（`self_actions`）与"杯子离开桌面进入我手中"（`env_changes`, `cause=self`）是同一事件的两个视角——一个是控制输入，一个是状态转移。模拟训练两边都要，所以两边都标。
 
 **证据约束**：因果方向必须有可见时序 + 合理机制支撑，怀疑边**存在**则不标；真实但微弱的影响用 `weak` 记录。0-3 条是常态，空数组合法。
 
-### awareness 三档定义（核心）
+### 心理层与意图隔离（mental_activity）
 
-`awareness` 衡量**情绪在多大程度上因果地驱动了可见行为**——它就是 emotion→action 边的
-`strength` 摘要，同一阶梯（low/medium/high ↔ weak/moderate/strong）：
+`psychology` = `{emotion, mental_activity}`，**仅凭本片段可见情境推断**（把这段当作唯一证据，不脑补之前发生了什么）：
 
-| 等级 | 定义 | 例子 |
-|---|---|---|
-| **low** | 情绪是背景色；行为由习惯/任务驱动，情绪没改变发生的事 | 放松地刷手机——"放松"在，但没改变"刷手机"这件事 |
-| **medium** | 情绪影响了动作的**表现形式**（语气/节奏/表情/幅度），但没改变**方向** | 开心地看着别人写字，笑得前仰后合，但还坐在原地看 |
-| **high** | 情绪**直接触发**了一个行为反应或转折 | 尴尬→伸手遮脸；生气→拍桌；焦虑→放下手头事起身离开 |
+- `emotion`：一两个小写关键词（neutral/focused/amused/anxious…），读不出来就 `neutral`。
+- `mental_activity`：第一人称一两句"此刻在想什么/在盘算什么"——是**全 schema 唯一允许出现意图与计划**的字段。动作、环境变化、因果边里严禁出现"准备/打算/想要/试图"（未观察到的目标）；意图是潜在状态，只住在这里。片段无线索时如实写"无特别线索，注意力在手头的事情上"，好过编造日程。
 
-`low/medium` 段是"情绪背景"，`high` 段是"情绪-行为转换点"——后者是我们要捕捉的核心研究对象。
-`awareness` 必须与任何写出的 `emotion->action` 边同档一致；边太弱不值得单写一条时 awareness
-照填（`low` 且无边是正常的）。管线在落盘前做一致性校验，发现 awareness 低估了边强度时打 warning。
+动作层（`self_actions`/`other_actions`）只写可观察的动作（姿态、接触、移动、设备使用）；环境事件/他人动了情绪或想法时，在此层说明原因，并同时记一条 `env->emotion` / `other->emotion` 因果边。
 
 ---
 
@@ -176,41 +175,41 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
   "clip_id": "DAY1_A1_JAKE_11100000_p2",   // 切分后带 _p{N} 后缀（见下）
   "global_idx": 5, "day": 1, "user": "A1_JAKE",
   "duration_s": 10.0,
-  "narrative": "{\n  \"self_actions\": [...\n}",   // 模型原始 JSON 全文，备追溯
-  "tags": ["meeting", "smartphone", "microphone", "discussion"],
+  "narrative": "{\n  \"environment\": {...\n}",   // 模型原始 JSON 全文，备追溯
   "model": "mimo-v2.5",
   "ts_captioned": "2026-08-11T00:37:48Z",
   "slice_path": "_cache\\slices\\DAY1_A1_JAKE_11100000_p2.mp4",
   "tokens": {"in": 3200, "out": 210, "cached": 747},
+  "environment": {
+    "setting": "明亮的室内会议空间，长方形桌子铺着红白格子桌布",
+    "near_field": ["黑色桌面麦克风（正前方）", "手机（白衣女生手中）"],
+    "background": "背景有白板和补光灯"
+  },
+  "people": [
+    {"id": "P1", "descriptor": "白衣女生", "name": "", "note": "坐我右手边"}
+  ],
   "self_actions": [
-    {"time": "11:10:10", "time_end": "11:10:12", "text": "我接回手机"},
-    {"time": "11:10:12", "time_end": "11:10:15", "text": "我低头看女生们依次点击屏幕"},
     {"time": "11:10:15", "time_end": "11:10:17", "text": "我左手拿起桌上的黑色麦克风"},
     {"time": "11:10:17", "time_end": "11:10:20", "text": "我拨动开关开启麦克风"}
   ],
-  "others": [
-    {"time": "11:10:12", "time_end": "11:10:15", "text": "白衣女生双手握着手机低头点击屏幕"}
+  "other_actions": [
+    {"time": "11:10:12", "time_end": "11:10:15", "person": "P1", "text": "白衣女生双手握着手机低头点击屏幕"}
   ],
-  "environment": "明亮的室内会议空间，长方形桌子铺着红白格子桌布，上有笔记本、手机、收纳包。背景有白板和补光灯。",
   "env_changes": [
-    {"time": "11:10:10", "time_end": "11:10:11", "text": "手机从女生手中回到我手里", "cause": "other"},
     {"time": "11:10:15", "time_end": "11:10:17", "text": "黑色麦克风离开桌面进入我左手", "cause": "self"},
     {"time": "11:10:17", "time_end": "11:10:18", "text": "麦克风电源接通", "cause": "self"}
   ],
   "speech": [
-    {"lang": "zh", "speaker": "A1_JAKE", "text": "都戳一下，每人戳一下。"}
+    {"lang": "zh", "speaker": "self", "text": "都戳一下，每人戳一下。"}
   ],
+  "sound": [],
+  "interface": [],
   "psychology": {
-    "awareness": "medium",
-    "emotion": "focused, neutral",
-    "note": "作为协调者引导设备操作测试。"
+    "emotion": "focused",
+    "mental_activity": "作为协调者引导设备操作测试，在想接下来让每人试一遍。"
   },
   "causal_links": [
-    {"type": "other->action", "cause": "11:10:12 白衣女生轮流点击手机屏幕测试", "effect": "11:10:15 我拿起麦克风准备录音", "strength": "moderate"},
     {"type": "action->env", "cause": "11:10:17 我拨动开关", "effect": "11:10:18 麦克风电源接通", "strength": "strong"}
-  ],
-  "ocr": [
-    {"where": "whiteboard", "text": "日程安排\n1. 站会", "note": "handwriting"}
   ],
   "clip_kind": "10s",              // "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
   "output_format": "json",        // "json" | "fallback_sectioned"
@@ -231,17 +230,21 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 `_p{N}` 后缀只在切分时（N>1）出现；不切分的片段（`--clip-duration 30` 或源视频 ≤ 目标时长）保持原 clip_id 无后缀。
 
 ### 字段说明
-- `self_actions` / `others`：`[{time, time_end, text}]`，`time` 为水印时间戳；无时间戳的行 `time=""` 但仍保留。**原子化**：一条 = 一个动词级步骤，复合行为拆开，无数量配额。
-- `environment`：整段一两句的**整体场景**（模拟器放置 agent 的上下文）；片段内的变化不写在这里。
-- `env_changes`：`[{time, time_end, text, cause}]`，片段内每次可观察的原子状态迁移；`cause ∈ {self, other, external}`（`external` = 无可见行为主体：自动门、天气、定时器）。
-- `speech`：`[{lang, speaker, text}]`，`lang ∈ {zh, en, ""}`。
-- `psychology`：`{awareness, emotion, note}`，缺失字段为空串；`awareness` 为 emotion→action 边的强度摘要（与 `strength` 同梯：low/medium/high ↔ weak/moderate/strong）。
-- `causal_links`：`[{type, cause, effect, strength}]`，`type` 为 7 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；`strength ∈ {strong, moderate, weak}`（反事实三档，见第 1 节；模型漏写或写非法值时宽松归一化为 `""`，不整单拒绝）；空数组合法（无可辩护的因果边时）。
-- `ocr`：`[{where, text, note}]`，**可选层**。`where ∈ {whiteboard, paper, screen, sign, other}`；`text` 为可读内容（尽量逐字）；`note` 可选（如"手写不清晰"）。**不 OCR 时间水印**。无可读文字表面时为 `[]`。
+- `environment`：`{setting, near_field[], background}`，模拟器放置 agent 的场景上下文；near_field 列我/他人可能交互的近场物体（带粗略方位），标签即全片段唯一命名——同一物体在各字段中逐字复用，识别不自信时如实描述外观属性而不猜类别。片段内的变化不写在这里（变化进 `env_changes`）。
+- `people`：`[{id, descriptor, name, note}]`，画面中其他人的花名册（不含自己）；`id`（"P1"…）与 `descriptor` 全片段复用，`name` 仅当场说出/显示才填。独自一人时为 `[]`。
+- `self_actions` / `other_actions`：`[{time, time_end, (person,) text}]`，`time` 为水印时间戳；无时间戳的行 `time=""` 但仍保留。**原子化**：一条 = 一个动词级步骤，复合行为拆开，无数量配额。`other_actions.person` 引用 `people.id`；只写可观察动作——意图只能进 `psychology.mental_activity`。
+- `env_changes`：`[{time, time_end, text, cause}]`，片段内每次可观察的原子状态迁移；`cause ∈ {self, other, external}`（`other` 时文中点名人物 id；`external` = 无可见行为主体：自动门、天气、定时器）。
+- `speech`：`[{lang, speaker, text}]`，`lang ∈ {zh, en, ""}`；`speaker` 为 `self` 或 `people.id`（听不清时用短描述）。
+- `sound`：`[{time, text, source}]`，离散非语音声音；`time` 仅在时刻可被画面锚定时才有（否则 `""`），持续环境音属于 `environment.setting`。
+- `interface`：`[{time, where, app_or_site, content, note}]`，条件触发层：屏幕做**页面级理解**（app/网站 + 页面类型 + 关键可见内容逐字），实体文字表面做转写；内容中途变化新增条目。无屏幕/文字表面时为 `[]`。**不转写时间水印。**
+- `psychology`：`{emotion, mental_activity}`，仅凭本片段推断（当唯一证据）；`mental_activity`（第一人称一两句）是全 schema **唯一**允许出现意图/计划的字段，缺失线索时如实写"无特别线索"而非编造。环境/他人动了情绪时，同时在 `causal_links` 记 `env->emotion` / `other->emotion` 边。
+- `causal_links`：`[{type, cause, effect, strength}]`，`type` 为 8 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；`strength ∈ {strong, moderate, weak}`（反事实三档，见第 1 节；模型漏写或写非法值时宽松归一化为 `""`，不整单拒绝）；空数组合法（无可辩护的因果边时）。
 - `narrative`：模型原始 JSON 全文（未解析），保完整以便人工核查/重新解析。
 - `clip_kind`：`30s`（不切分的标准源）/ `segment_open`（一天开头的不规则短段，如 `11094208`）/ `10s`/`15s`/`6s`/`5s`（切分片段）。`60s`（合并）已移除。
 - `output_format`：`json`（主路径）/ `fallback_sectioned`（模型无视 json_object 模式时，回退到 sectioned 解析）。
 - `recovery`：标注此 clip 经历的路径——`ok`（一次成功）/ `fallback_sectioned` / `10s_slices`（仅 `--clip-duration 30` 下，被拒后切成 10s 重试）。
+
+> **schema 沿革**：2026-08 起新 schema 为上（`environment` 对象 + `people`/`sound`/`interface`/`mental_activity`；移除 `tags`/`ocr`/`others`/`awareness`）。旧输出文件里的行保持旧形状（`tags`、`others`、`environment` 字符串、`ocr`、`psychology.note`），JSONL 逐行解析互不影响；解析器同时兼容旧形状（归一到新字段：`others`→`other_actions(person="")`、字符串 `environment`→`setting`、`ocr`→`interface`、`note`→`mental_activity`）。下游消费 jsonl 时请按行判断字段存在性。
 
 ---
 

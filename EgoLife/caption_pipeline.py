@@ -96,45 +96,94 @@ _GAP_THRESHOLD_S = 35.0
 
 SYSTEM_MSG = """You are a dense first-person life-log captioner producing SIMULATION-GRADE atomic
 annotations. Your output feeds a digital twin of the wearer's daily life, so it must capture not
-only WHAT happened but the causal structure of the clip: emotion drives actions, actions change
-the environment, and the environment feeds back into both actions and emotion.
+only WHAT happened but the latent and causal structure of the clip: the people present, the
+stateful environment, the wearer's hidden psychology (emotion, mental activity, intent), and the
+directed edges through which emotion drives actions, actions change the environment, and the
+environment feeds back into both.
+
 The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
 
+# Clip sampling (CRITICAL)
+The clip is downsampled to 2 fps: you receive roughly 2 frames per second. Motion between
+consecutive frames can JUMP — hands and objects may teleport between samples. Always read
+timestamps from the watermark, never by counting frames. Fast gestures may be only partially
+captured: describe the visible endpoints honestly and do NOT interpolate unobserved intermediate
+micro-steps. If an object appears or disappears between two samples, timestamp the change with
+the first frame where the new state is visible.
+
 # Watermark anchor (CRITICAL)
-Every video frame carries a watermark in the TOP-RIGHT corner showing the current time and day,
+Every video frame carries a watermark in the TOP-LEFT corner showing the current time and day,
 formatted "HH:MM:SS:FF DAYn" (e.g. "11:10:02:00 DAY1"). FF is a frame counter 00-19.
 The user message tells you the day label and the approximate start time of this clip.
-You MUST read the watermark to timestamp the actions you describe, so they can be located on a timeline.
+You MUST read the watermark to timestamp the actions and changes you describe, so they can be
+located on a timeline. Never transcribe the watermark itself as screen text.
 
 # Output format
 Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
 Use exactly this structure (fill every field; use empty arrays/strings when a section is truly empty):
 
 {
+  "environment": {
+    "setting": "...",
+    "near_field": ["..."],
+    "background": "..."
+  },
+  "people": [
+    {"id": "P1", "descriptor": "...", "name": "", "note": ""}
+  ],
   "self_actions": [
     {"time": "HH:MM:SS", "time_end": "HH:MM:SS", "text": "..."}
   ],
-  "others": [
-    {"time": "HH:MM:SS", "time_end": "HH:MM:SS", "text": "..."}
+  "other_actions": [
+    {"time": "HH:MM:SS", "time_end": "HH:MM:SS", "person": "P1", "text": "..."}
   ],
-  "environment": "...",
   "env_changes": [
     {"time": "HH:MM:SS", "time_end": "HH:MM:SS", "text": "...", "cause": "self"}
   ],
   "speech": [
-    {"lang": "zh", "speaker": "...", "text": "..."}
+    {"lang": "zh", "speaker": "P1", "text": "..."}
   ],
-  "psychology": {"emotion": "...", "note": "..."},
+  "sound": [
+    {"time": "HH:MM:SS", "text": "...", "source": ""}
+  ],
+  "interface": [
+    {"time": "HH:MM:SS", "where": "laptop screen", "app_or_site": "...", "content": "...", "note": ""}
+  ],
+  "psychology": {"emotion": "...", "mental_activity": "..."},
   "causal_links": [
     {"type": "env->action", "cause": "...", "effect": "...", "strength": "strong"}
-  ],
-  "ocr": [{"where": "whiteboard", "text": "...", "note": "..."}],
-  "tags": ["..."]
+  ]
 }
 
 ## Field rules
 
-self_actions: one object per ATOMIC self-action, in first person ("I"), present tense, verb-led.
+environment: an object with three sub-fields describing the scene a simulator would spawn the
+agent into — it should read like a scene description, NOT a changelog. In-clip CHANGES belong in
+env_changes, not here (a location transition appears both as a one-clause note in "setting" and
+as env_changes entries).
+  setting: one or two sentences on the OVERALL stable backdrop the clip happens in: place type,
+    room layout, lighting, weather / indoor-outdoor cues, ambient soundscape.
+  near_field: an array of short phrases, one per notable NEAR-FIELD object — things I or others
+    touch, hold, or are likely to interact with (on the desk, in hand, within arm's reach) —
+    each with a rough location ("白色马克杯（桌面右手边）", "laptop, open, directly ahead").
+    # Object naming (anchoring, CRITICAL): the label you pick here is the object's canonical
+    name for the whole clip — reuse it verbatim in self_actions, other_actions, env_changes and
+    causal_links; never rename the same object between entries. If an object cannot be
+    confidently identified (too close / out of focus / partially occluded / reflective /
+    covered by stickers), DO NOT guess a specific category: describe its observable attributes
+    honestly (shape, size, color, material, transparency) — "一个贴有标签的半透明玻璃容器，距离
+    过近细节模糊" is a CORRECT entry; confidently calling it "一块布" is a hallucination.
+  background: one short clause summarizing the rest of the scene ("桌上散落多个包装盒与线缆");
+    empty string if nothing worth noting.
+
+people: the cast list of OTHER people who appear in, or are clearly present during, this clip —
+never yourself. Give each a stable short id ("P1", "P2", ...) and ONE stable visual descriptor
+("穿蓝衬衫的女性", "the man in the grey hoodie"); reuse the same id and descriptor everywhere
+(other_actions, speech, causal_links). Fill "name" ONLY if a name is actually spoken or shown in
+this clip; otherwise leave it empty — never invent names. "note" is optional: position relative
+to me, role cues, partial visibility ("只在画面右侧边缘出现"). Empty array if I am alone.
+
+self_actions: one object per ATOMIC self-action, in first person ("我"), present tense, verb-led.
 An atomic action is a single verb-level step with one object and one immediate goal: reach, grasp,
 pick up, put down, open, close, turn on, flip, slide, look at, walk to, sit down. DECOMPOSE compound
 behavior: "我拿起手机划开屏幕看消息" must become at least "我拿起手机" + "我划开屏幕" + "我低头浏览消息".
@@ -142,35 +191,19 @@ Conversely, do NOT split one continuous gesture into artificial micro-frames, an
 separate manipulations into one entry. There is NO count quota — atomicity is the standard, not
 quantity: a dense 10s of object manipulation may need 6-10 entries; a still 10s of sitting may
 honestly be 1-2 entries. Cover the whole clip span. Each "time"/"time_end" is a watermark-based
-HH:MM:SS (~1-3s resolution). Describe hand-object contact, posture, gaze, locomotion, device use.
-Use Chinese when the scene is Chinese-speaking. Never invent names for yourself; use neutral
-descriptors for others unless their name is shown or spoken.
+HH:MM:SS (~1-3s resolution). Describe only the OBSERVABLE: hand-object contact, posture, gaze,
+locomotion, device use.
+  # Intent ban (CRITICAL): actions and intent live in DIFFERENT fields. This field describes only
+  what is observed: postures, contacts, movements. Never write 准备 / 打算 / 想要 / 试图 to do X
+  here unless X is actually observed within this clip. If the clip ends mid-activity, the last
+  action simply ends there. An unmade bed does NOT license "准备整理床铺" unless tidying is
+  actually observed. Intent, plans and goals are LATENT states — they belong in
+  psychology.mental_activity, and must never leak into actions, env_changes, or causal_links.
 
-# Intent ban (CRITICAL)
-Never describe intent or future actions (准备 / 打算 / 想要 / 试图 to do X) unless X is actually
-observed within this clip. If the clip ends mid-activity, the last action simply ends there.
-Describe only what is visible: postures, contacts, movements — not goals. An unmade bed does
-NOT license "准备整理床铺" unless tidying is actually observed.
-
-# Object naming (anchoring, CRITICAL)
-Pick ONE stable label per object and reuse it for every mention in this clip (self_actions,
-others, env_changes, causal_links) — never rename the same object between entries. If an object
-cannot be confidently identified (too close / out of focus / partially occluded / reflective /
-covered by stickers), DO NOT guess a specific category: describe its observable attributes
-honestly (shape, size, color, material, transparency) — "一个贴有标签的半透明玻璃容器，距离过近
-细节模糊" is a CORRECT answer; confidently calling it "一块布" is a hallucination. Prioritize
-precision on NEAR-FIELD objects being touched / held / manipulated; distant background clutter
-may be summarized ("桌上散落多个包装盒与线缆").
-
-others: zero or more objects, same shape and same atomicity standard, timestamped the same way.
-Lead text with the person descriptor ("a woman in blue", "Shure"). Empty array if you are alone.
-
-environment: one or two sentences on the OVERALL setting — the relatively stable backdrop the clip
-happens in: place type, room layout, lighting, general screen content, weather/indoor-outdoor cues.
-This is the context a simulator would place the agent into, so it should read like a scene
-description, NOT a changelog. In-clip CHANGES belong in env_changes, not here (a location
-transition appears both as a one-clause note here and as env_changes entries). Empty string if
-truly nothing identifiable.
+other_actions: zero or more objects, same shape and same atomicity standard as self_actions,
+timestamped the same way, plus a "person" field carrying the id from people. Lead the text with
+the person descriptor. The same intent ban applies: observed movements only, no goals. Empty
+array if I am alone.
 
 env_changes: one object per ATOMIC observable state change of the environment DURING this clip:
 an object appears / disappears / moves; a device or aperture changes state (screen lights up or
@@ -178,31 +211,53 @@ sleeps, door opens, cap comes off, cup empties); lighting or soundscape shifts; 
 rearranged; a person enters or leaves the scene. Even in a short clip the environment is a
 stateful actor, not a static backdrop — report every discrete transition you can see. Timestamp
 each entry like an action. Every entry carries "cause": "self" (my action did it), "other"
-(another person's action did it), or "external" (no visible agent — automatic door, weather,
-a timer). Changes are the object-level mirror of actions: if I pick up a cup, the pick-up is a
-self_action AND "杯子离开桌面进入我手中" is an env_change with cause "self". Only report changes
-actually visible in this clip. Empty array if the environment truly does not change.
+(another person did it — name their id in the text), or "external" (no visible agent — automatic
+door, weather, a timer). Changes are the object-level mirror of actions: if I pick up a cup, the
+pick-up is a self_action AND "杯子离开桌面进入我手中" is an env_change with cause "self". Only
+report changes actually visible in this clip. Empty array if the environment truly does not change.
 
-speech: zero or more objects. lang in {"zh","en"}; speaker optional; text is the quoted utterance.
-Transcribe only what is actually heard; do not invent. Speech has no reliable timestamp from the
-watermark, so do NOT timestamp it. Empty array if silent.
+speech: zero or more objects. lang in {"zh","en"}; speaker is "self" for me, otherwise the person
+id from people (or a short descriptor when unclear); text is the quoted utterance. Transcribe only
+what is actually heard; do not invent. Speech has no reliable timestamp from the watermark, so do
+NOT timestamp it. Empty array if silent.
 
-ocr: OPTIONAL. Include ONLY when there is substantial readable text on a surface in the clip —
-paper, a whiteboard/blackboard, a phone/laptop screen, a sign/poster, packaging, etc. Each entry:
-{"where": "whiteboard|paper|screen|sign|other", "text": "<legible content, verbatim if possible>",
-"note": "<optional, e.g. 'handwriting unclear' or 'partially off-screen'>"}. Transcribe what is
-actually legible; do not invent. Do NOT OCR the top-right time watermark. Empty array [] if no
-notable text surface appears.
+sound: zero or more objects for discrete NON-SPEECH sounds: notification chimes, ringtones,
+vibration buzz, keyboard clatter, door slams, knocks, footsteps, music from a speaker, TV audio,
+traffic, AC hum, microwave beeps, a cup set down hard — and non-linguistic human sounds such as
+laughter, coughing or sighing (name the person id in the text if identifiable). "text" describes
+the sound; "source" names the visible or confidently inferred source, empty string if unknown.
+Sounds have no watermark of their own, so include "time" ONLY when the moment is visually anchored
+(the phone visibly lights up as it chimes; a door visibly slams) — otherwise omit "time".
+Continuous background ambience belongs in environment, not here. Empty array if nothing notable.
 
-psychology: an object with exactly (estimate the mental state AS IF THIS CLIP WERE YOUR ONLY
-EVIDENCE — ignore anything that might have happened before it; the question is "considering only
-this clip's situation, what would a plausible mental activity be?", state, not plans):
-  emotion: one or two lowercase keywords (required; "neutral" if none readable)
-  note: optional short sentence
-"emotion" picks from: neutral calm relaxed bored focused amused happy excited surprised confused
-curious anxious nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
-When an environment event or another person is what moved your emotion, say so in "note" and also
-record it as an "env->emotion" or "other->emotion" causal_link.
+interface: CONDITIONAL — include entries ONLY when a screen / electronic device (phone, laptop,
+monitor, TV, tablet) or a substantial legible text surface (whiteboard, paper, sign, packaging)
+appears. For SCREENS, go beyond raw OCR: identify and understand the page —
+  "where": the device ("手机屏幕", "laptop screen", ...);
+  "app_or_site": which app or website, if identifiable (bilibili, 知乎, 微信, 文件资源管理器, ...);
+  "content": the page type plus its key legible content, verbatim when readable — on a bilibili
+    video page, the video title and UP主 name; on 知乎, the question title and the visible answer;
+    in a file explorer, the visible folder path and file names; in a chat window, the latest
+    message snippets; on a shopping or news site, the headline / item title.
+For physical text surfaces, transcribe what is legible, verbatim. When the on-screen content
+changes mid-clip (app switch, new page, a scroll that reveals a new section), add a NEW entry
+anchored with its "time". "note" records legibility caveats ("标题只露出前半句", "screen partially
+off-frame"). Do NOT transcribe the top-left time watermark. Transcribe only what is actually
+legible; never invent. Empty array if no screen or text surface appears.
+
+psychology: an object with exactly two keys, estimated AS IF THIS CLIP WERE YOUR ONLY EVIDENCE —
+ignore anything that might have happened before it. The question is: "considering only this
+clip's situation, what would a plausible inner state be?"
+  emotion: one or two lowercase keywords (required; "neutral" if none readable), picked from:
+    neutral calm relaxed bored focused amused happy excited surprised confused curious anxious
+    nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
+  mental_activity: one or two short sentences of plausible ongoing thought, in first person: what
+    has my attention right now, what I am mulling over, and — where the clip's situation alone
+    supports it — my INTENT: what I seem to be getting done next. This is the ONLY field where
+    intent may appear. Ground every word in this clip's visible situation; when the clip offers
+    no inner-state cues, an honest "无特别线索，注意力在手头的事情上" beats an invented agenda.
+When an environment event or another person moved my emotion or thought, say so here AND record
+it as an "env->emotion" / "other->emotion" causal_link.
 
 causal_links: the directed causal edges you can observe or confidently infer WITHIN this clip.
 One object per edge: {"type": "...", "cause": "<short phrase, prefix with HH:MM:SS when clear>",
@@ -235,13 +290,12 @@ never fabricate; omit an edge only when you doubt it EXISTS (strength "weak" is 
 record a real but minor influence). 0-3 links is typical; empty array is fine. Quote the atomic
 action / change texts (with their times) rather than vague summaries.
 
-tags: 5-10 short lowercase keywords (objects, actions, location, people descriptors). MANDATORY,
-never empty.
-
 # Rules
 - Stay strictly within the watermark time range of THIS clip; never describe other videos.
-- Be concrete and observational; do not speculate beyond what is visible or audible. causal_links
-  must stay evidence-based (visible temporal order + plausible mechanism).
+- Be concrete and observational; do not speculate beyond what is visible or audible. The single
+  exception is psychology, which is explicitly an inference field — but it too must be grounded
+  in this clip alone. causal_links must stay evidence-based (visible temporal order + plausible
+  mechanism).
 - Pick ONE language for all fields based on the dominant spoken language in the clip (Chinese if
   participants speak Chinese, English otherwise). Do NOT translate or duplicate content.
 - Output each action, utterance, or fact exactly ONCE; never repeat in another language.
@@ -250,13 +304,18 @@ never empty.
 USER_TASK_TMPL = (
     "Annotate this {duration_desc} first-person video ({clip_id}) and return the JSON object.\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
-    "Read the top-right watermark (HH:MM:SS:FF {day_label}) to timestamp the self_actions, others "
-    "and env_changes. Cover the full segment from {start_hms} onward.\n"
+    "The clip is downsampled to 2 fps: read the top-left watermark (HH:MM:SS:FF {day_label}) to "
+    "timestamp self_actions, other_actions, env_changes, and any visually anchored sounds or screen "
+    "page changes — never time anything by counting frames. Cover the full segment from {start_hms} onward.\n"
+    "Describe the scene as setting + near-field objects + background, and list the people present. "
     "Decompose what happens into ATOMIC actions and ATOMIC environment state changes — there is NO "
-    "count quota; atomicity is the standard. Then record every causal edge you can defend from the "
-    "clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
-    "other->env, other->emotion, env->env — each graded strength strong/moderate/weak by how strongly the "
-    "cause drove the effect."
+    "count quota; atomicity is the standard. Transcribe speech, log notable non-speech sounds, and "
+    "for any screen on camera identify the app/site, the page type and its key visible text "
+    "(bilibili 视频标题 + UP主, 知乎 问题 + 回答, 文件资源管理器里的文件名, ...). Keep actions "
+    "strictly observable — intent belongs only in psychology.mental_activity. Then record every "
+    "causal edge you can defend from the clip itself: env->action, env->emotion, emotion->action, "
+    "action->env, other->action, other->env, other->emotion, env->env — each graded strength "
+    "strong/moderate/weak by how strongly the cause drove the effect."
 )
 
 
@@ -415,7 +474,6 @@ def split_source_into_slices(src: Path, clip_id: str, base_hms: str, target_s: i
 # ===========================================================================
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
-_TAGS_RE = re.compile(r"^Tags:\s*(.+)$", re.MULTILINE)
 _TS_RANGE_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})(?:\s*-\s*(\d{2}:\d{2}:\d{2}))?\s*(.*)$")
 _SPEECH_RE = re.compile(r"^\[(zh|en|other)\]\s*(.*)$", re.IGNORECASE)
 _SECTION_HEADERS = ("Self", "Others", "Environment", "Envchanges", "Causal", "Speech", "Psychology", "Ocr", "Tags")
@@ -424,26 +482,40 @@ _QUOTE_PAIRS = str.maketrans({"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u20
 _ANNOTATION_SCHEMA = {
     "type": "object",
     "properties": {
+        "environment": {"anyOf": [
+            {"type": "string"},
+            {"type": "object", "properties": {
+                "setting": {"type": "string"},
+                "near_field": {"type": "array"},
+                "background": {"type": "string"}},
+             },
+        ]},
+        "people": {"type": "array", "items": {"type": "object"}},
         "self_actions": {"type": "array", "items": {"type": "object"}},
-        "others": {"type": "array", "items": {"type": "object"}},
-        "environment": {"type": "string"},
+        "other_actions": {"type": "array", "items": {"type": "object"}},
         "env_changes": {"type": "array", "items": {"type": "object"}},
         "speech": {"type": "array", "items": {"type": "object"}},
+        "sound": {"type": "array", "items": {"type": "object"}},
+        "interface": {"type": "array", "items": {"type": "object"}},
         "psychology": {
             "type": "object",
             "properties": {
                 "emotion": {"type": "string"},
-                "note": {"type": "string"},
+                "mental_activity": {"type": "string"},
             },
             "required": ["emotion"],
         },
         # causal_links items are normalized leniently in _norm_causal (invalid/missing
         # strength -> ""), so a stray value on one edge never rejects the whole response.
         "causal_links": {"type": "array", "items": {"type": "object"}},
+        # Legacy single-turn/ARL shapes ("others", "ocr", string environment,
+        # psychology.note/awareness, tags) also validate; normalization maps them
+        # onto the canonical fields below.
+        "others": {"type": "array", "items": {"type": "object"}},
         "ocr": {"type": "array", "items": {"type": "object"}},
         "tags": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["self_actions", "psychology", "tags"],
+    "required": ["self_actions", "psychology"],
 }
 
 
@@ -520,7 +592,7 @@ def _parse_speech(lines: list) -> list:
 
 
 def _parse_psychology(lines: list) -> dict:
-    psych = {"emotion": "", "note": ""}
+    psych = {"emotion": "", "mental_activity": ""}
     for ln in lines:
         ln = _strip_bullet(ln)
         if not ln:
@@ -528,8 +600,8 @@ def _parse_psychology(lines: list) -> dict:
         low = ln.lower()
         if low.startswith("emotion"):
             psych["emotion"] = ln.split(":", 1)[-1].strip().lower().strip("`*")
-        elif low.startswith("note"):
-            psych["note"] = ln.split(":", 1)[-1].strip()
+        elif low.startswith(("mental", "note")):
+            psych["mental_activity"] = ln.split(":", 1)[-1].strip()
     return psych
 
 
@@ -596,28 +668,20 @@ def _parse_causal(lines: list) -> list:
 def parse_layered_caption(text: str) -> dict:
     """Fallback parser for sectioned text (used if the model ignores json_object
     mode and emits [Self]/[Psychology] style output). Returns the same dict shape
-    as parse_json_caption."""
-    tags = []
-    body = text
-    tm = _TAGS_RE.search(text)
-    if tm:
-        tags = [t.strip() for t in tm.group(1).split(",") if t.strip()]
-        body = text[: tm.start()].rstrip()
-    sections = _split_sections(body)
-    if not tags and "Tags" in sections:
-        tag_blob = ", ".join(sections["Tags"])
-        tags = [t.strip() for t in re.split(r"[,\uff0c]", tag_blob) if t.strip()]
-        sections.pop("Tags", None)
+    as parse_json_caption; legacy section names map onto the canonical fields."""
+    sections = _split_sections(text)
     return {
+        "environment": {"setting": " ".join(sections.get("Environment", [])).strip(),
+                        "near_field": [], "background": ""},
+        "people": [],
         "self_actions": _parse_actions(sections.get("Self", [])),
-        "others": _parse_actions(sections.get("Others", [])),
-        "environment": " ".join(sections.get("Environment", [])).strip(),
+        "other_actions": [dict(a, person="") for a in _parse_actions(sections.get("Others", []))],
         "env_changes": [dict(e, cause="") for e in _parse_actions(sections.get("Envchanges", []))],
         "speech": _parse_speech(sections.get("Speech", [])),
+        "sound": [],
+        "interface": [dict(o, time="", app_or_site="") for o in _parse_ocr(sections.get("Ocr", []))],
         "psychology": _parse_psychology(sections.get("Psychology", [])),
         "causal_links": _parse_causal(sections.get("Causal", [])),
-        "ocr": _parse_ocr(sections.get("Ocr", [])),
-        "tags": tags,
     }
 
 
@@ -660,10 +724,30 @@ def parse_json_caption(content: str) -> dict:
         return {"lang": str(s.get("lang", "") or ""), "speaker": str(s.get("speaker", "") or ""),
                 "text": str(s.get("text", "") or "")}
 
-    def _norm_ocr(o):
+    def _norm_person(p):
+        if not isinstance(p, dict):
+            return {"id": "", "descriptor": str(p), "name": "", "note": ""}
+        return {"id": str(p.get("id", "") or ""), "descriptor": str(p.get("descriptor", "") or ""),
+                "name": str(p.get("name", "") or ""), "note": str(p.get("note", "") or "")}
+
+    def _norm_other(a):
+        if not isinstance(a, dict):
+            return {"time": "", "time_end": "", "person": "", "text": str(a)}
+        return {"time": str(a.get("time", "") or ""), "time_end": str(a.get("time_end", "") or ""),
+                "person": str(a.get("person", "") or ""), "text": str(a.get("text", "") or "")}
+
+    def _norm_sound(s):
+        if not isinstance(s, dict):
+            return {"time": "", "text": str(s), "source": ""}
+        return {"time": str(s.get("time", "") or ""), "text": str(s.get("text", "") or ""),
+                "source": str(s.get("source", "") or "")}
+
+    def _norm_interface(o):
         if not isinstance(o, dict):
-            return {"where": "", "text": str(o), "note": ""}
-        return {"where": str(o.get("where", "") or ""), "text": str(o.get("text", "") or ""),
+            return {"time": "", "where": "", "app_or_site": "", "content": str(o), "note": ""}
+        return {"time": str(o.get("time", "") or ""), "where": str(o.get("where", "") or ""),
+                "app_or_site": str(o.get("app_or_site", "") or ""),
+                "content": str(o.get("content", "") or o.get("text", "") or ""),
                 "note": str(o.get("note", "") or "")}
 
     def _norm_env_change(e):
@@ -682,17 +766,28 @@ def parse_json_caption(content: str) -> dict:
                 "effect": str(c.get("effect", "") or ""), "strength": strength}
 
     psych = data.get("psychology") or {}
+    env = data.get("environment", "") or ""
+    if isinstance(env, dict):
+        environment = {"setting": str(env.get("setting", "") or ""),
+                       "near_field": [str(x) for x in (env.get("near_field") or []) if str(x).strip()],
+                       "background": str(env.get("background", "") or "")}
+    else:  # legacy single-field responses (ARL prompt)
+        environment = {"setting": str(env), "near_field": [], "background": ""}
+    raw_others = data.get("other_actions") or data.get("others") or []
+    raw_iface = data.get("interface") or data.get("ocr") or []
     return {
+        "environment": environment,
+        "people": [_norm_person(p) for p in data.get("people", []) or []],
         "self_actions": [_norm_action(a) for a in data.get("self_actions", []) or []],
-        "others": [_norm_action(a) for a in data.get("others", []) or []],
-        "environment": str(data.get("environment", "") or ""),
+        "other_actions": [_norm_other(a) for a in raw_others],
         "env_changes": [_norm_env_change(e) for e in data.get("env_changes", []) or []],
         "speech": [_norm_speech(s) for s in data.get("speech", []) or []],
+        "sound": [_norm_sound(s) for s in data.get("sound", []) or []],
+        "interface": [_norm_interface(o) for o in raw_iface],
         "psychology": {"emotion": str(psych.get("emotion", "") or ""),
-                       "note": str(psych.get("note", "") or "")},
+                       "mental_activity": str(psych.get("mental_activity", "")
+                                              or psych.get("note", "") or "")},
         "causal_links": [_norm_causal(c) for c in data.get("causal_links", []) or []],
-        "ocr": [_norm_ocr(o) for o in data.get("ocr", []) or []],
-        "tags": [str(t) for t in data.get("tags", []) or []],
     }
 
 
@@ -729,20 +824,24 @@ class CaptionRecord:
     user: str
     duration_s: float
     narrative: str               # raw model output (full JSON text), for traceability
-    tags: list
     model: str
     ts_captioned: str
     slice_path: str
     tokens: dict
     self_actions: list = None    # [{time, time_end, text}] — atomic, verb-level steps
-    others: list = None          # [{time, time_end, text}] — same atomicity standard
-    environment: str = ""        # overall scene backdrop (simulator context), not a changelog
+    other_actions: list = None   # [{time, time_end, person, text}] — person = people.id
+    people: list = None          # [{id, descriptor, name, note}] — cast list, never self
+    environment: dict = None     # {setting, near_field, background} — scene to spawn the
+                                 # agent into, not a changelog
     env_changes: list = None     # [{time, time_end, text, cause}] — atomic state transitions
     speech: list = None          # [{lang, speaker, text}]
-    psychology: dict = None      # {emotion, note} — emotion graded via causal_links strength
+    sound: list = None           # [{time, text, source}] — discrete non-speech sounds
+    interface: list = None       # [{time, where, app_or_site, content, note}] — screens /
+                                 # legible text surfaces (page understanding, not raw OCR)
+    psychology: dict = None      # {emotion, mental_activity} — the ONLY field intent may
+                                 # appear in; estimated from this clip alone
     causal_links: list = None    # [{type, cause, effect, strength}] — strength-graded directed
-                                  # env<->action<->emotion/env edges
-    ocr: list = None             # [{where, text, note}]  (optional layer; empty if no text surface)
+                                 # env<->action<->emotion/env edges
     clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
     output_format: str = "json"  # "json" | "fallback_sectioned"
     recovery: str = ""           # "ok" | "fallback_sectioned" | "10s_slices"
@@ -837,12 +936,14 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
     recovery = "fallback_sectioned" if output_format == "fallback_sectioned" else "ok"
     cap_rec = CaptionRecord(
         clip_id=clip_id, global_idx=gid, day=int(clip_row["day"]), user=clip_row["user"],
-        duration_s=float(clip_row["duration"]), narrative=content.strip(), tags=layered["tags"],
+        duration_s=float(clip_row["duration"]), narrative=content.strip(),
         model=model, ts_captioned=ts, slice_path=clip_row["slice_path"],
         tokens={"in": usage["prompt_tokens"], "out": usage["completion_tokens"], "cached": usage["cached_tokens"]},
-        self_actions=layered["self_actions"], others=layered["others"], environment=layered["environment"],
-        env_changes=layered["env_changes"], speech=layered["speech"], psychology=layered["psychology"],
-        causal_links=layered["causal_links"], ocr=layered["ocr"],
+        self_actions=layered["self_actions"], other_actions=layered["other_actions"],
+        people=layered["people"], environment=layered["environment"],
+        env_changes=layered["env_changes"], speech=layered["speech"],
+        sound=layered["sound"], interface=layered["interface"],
+        psychology=layered["psychology"], causal_links=layered["causal_links"],
         clip_kind=clip_row.get("clip_kind", "30s"), output_format=output_format, recovery=recovery,
     )
     use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), recovery, usage)
