@@ -273,7 +273,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--no-json-mode` | off | 关闭 `response_format=json_object`（debug） |
 | **并发** | | |
 | `--max-rpm` | `90` | 全局 RPM 上限（Mimo 硬限 100，留余量） |
-| `--api-workers` | `6` | API worker 线程 |
+| `--api-workers` | `max(--max-rpm/2, 20)`（默认 rpm=90 时即 45） | API worker 线程。thinking 单请求 ~30s+，每个 worker 约每分钟 2 发，rpm/2 个并发即可吃满 RPM 上限；下限 20 兜底慢网络 |
 | `--preprocess-workers` | `2` | ffmpeg 编码线程 |
 | **流程** | | |
 | `--skip-preprocess` | off | 只 caption，读 `_cache/` 里已有的 slices |
@@ -338,7 +338,7 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 
 | 场景 | 推荐参数 |
 |---|---|
-| 标准跑（因果标注质量优先） | 默认即可：`--max-rpm 90 --api-workers 6`（thinking on, 10s 切分） |
+| 标准跑（因果标注质量优先） | 默认即可（`--max-rpm 90`，api-workers 自动 = max(rpm/2, 20) = 45；thinking on, 10s 切分） |
 | 大批量、预算敏感 | `--thinking disabled --max-rpm 95 --api-workers 8`（放弃推理链，留意 429） |
 | 调试 prompt | `--limit 3 --api-workers 1`（串行，便于看日志） |
 

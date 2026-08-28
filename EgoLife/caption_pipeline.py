@@ -1303,7 +1303,10 @@ def main():
                     help="disable response_format=json_object (debug)")
     # --- Concurrency ---
     ap.add_argument("--max-rpm", type=int, default=90, help="global RPM cap (Mimo limit is 100)")
-    ap.add_argument("--api-workers", type=int, default=6)
+    ap.add_argument("--api-workers", type=int, default=None,
+                    help="API worker threads (default: max(--max-rpm/2, 20) — thinking-mode "
+                         "requests take ~30s+ each, so ~2 requests/min per worker and rpm/2 "
+                         "in-flight workers saturate the RPM cap)")
     ap.add_argument("--preprocess-workers", type=int, default=2)
     # --- Flow ---
     ap.add_argument("--skip-preprocess", action="store_true",
@@ -1316,6 +1319,11 @@ def main():
                     help="confirm --reset when the output already has >10 records (prevents accidental data loss)")
     ap.add_argument("--limit", type=int, default=None, help="only process first N clips (debug)")
     args = ap.parse_args()
+
+    # Thinking-mode requests run ~30s+, so each worker only completes ~2 requests/min:
+    # rpm/2 workers saturate the RPM cap; the floor of 20 guards slower networks.
+    if args.api_workers is None:
+        args.api_workers = max(args.max_rpm // 2, 20)
 
     # --- Load API key ---
     env_paths = []
