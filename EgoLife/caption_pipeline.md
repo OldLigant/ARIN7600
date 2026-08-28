@@ -212,8 +212,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
     {"type": "action->env", "cause": "11:10:17 我拨动开关", "effect": "11:10:18 麦克风电源接通", "strength": "strong"}
   ],
   "clip_kind": "10s",              // "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
-  "output_format": "json",        // "json" | "fallback_sectioned"
-  "recovery": "ok"                // "ok" | "fallback_sectioned" | "10s_slices"
+  "recovery": "ok"                // "ok" | "10s_slices"
 }
 ```
 
@@ -241,10 +240,9 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 - `causal_links`：`[{type, cause, effect, strength}]`，`type` 为 8 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；`strength ∈ {strong, moderate, weak}`（反事实三档，见第 1 节；模型漏写或写非法值时宽松归一化为 `""`，不整单拒绝）；空数组合法（无可辩护的因果边时）。
 - `narrative`：模型原始 JSON 全文（未解析），保完整以便人工核查/重新解析。
 - `clip_kind`：`30s`（不切分的标准源）/ `segment_open`（一天开头的不规则短段，如 `11094208`）/ `10s`/`15s`/`6s`/`5s`（切分片段）。`60s`（合并）已移除。
-- `output_format`：`json`（主路径）/ `fallback_sectioned`（模型无视 json_object 模式时，回退到 sectioned 解析）。
-- `recovery`：标注此 clip 经历的路径——`ok`（一次成功）/ `fallback_sectioned` / `10s_slices`（仅 `--clip-duration 30` 下，被拒后切成 10s 重试）。
+- `recovery`：标注此 clip 经历的路径——`ok`（一次成功）/ `10s_slices`（仅 `--clip-duration 30` 下，被拒后切成 10s 重试）。
 
-> **schema 沿革**：2026-08 起新 schema 为上（`environment` 对象 + `people`/`sound`/`interface`/`mental_activity`；移除 `tags`/`ocr`/`others`/`awareness`）。旧输出文件里的行保持旧形状（`tags`、`others`、`environment` 字符串、`ocr`、`psychology.note`），JSONL 逐行解析互不影响；解析器同时兼容旧形状（归一到新字段：`others`→`other_actions(person="")`、字符串 `environment`→`setting`、`ocr`→`interface`、`note`→`mental_activity`）。下游消费 jsonl 时请按行判断字段存在性。
+> **schema 沿革**：2026-08 大重构后统一为上（`environment` 对象 + `people`/`sound`/`interface`/`mental_activity`；移除 `tags`/`ocr`/`others`/`awareness`；sectioned 兜底解析已删除，JSON 失败即 `parse_failed`）。历史输出文件里的行保持生成时的旧形状，解析器**不再**做旧→新映射；重跑后所有新行均为新形状。下游消费 jsonl 时请按行判断字段存在性。
 
 ---
 
@@ -310,10 +308,9 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 ### 错误分类（summary.json 里分项计数）
 
 不再笼统标 "rejected"，而是区分：
-- `safety_rejection`：Mimo 安全过滤器拒绝（≤25 token 且无结构）
-- `parse_failed`：JSON 无效或 schema 校验失败
+- `safety_rejection`：Mimo 安全过滤器拒绝（≤25 token 且非 JSON 对象开头）
+- `parse_failed`：JSON 无效或 schema 校验失败（无兜底解析，直接失败）
 - `empty`：模型返回空
-- `fallback_sectioned`：JSON 失败但 sectioned 解析成功（兜底）
 - `first_attempt_rejection`：首次被拒（safety/parse/empty），已自动 retry——Mimo 的常见行为，retry 命中前缀缓存（1/50 价）几乎必成。
 
 失败时原始模型输出存进 `UsageRecord.raw_content`（summary 的 `round_breakdown` 里也有前 200 字预览），便于事后排查。
@@ -330,8 +327,9 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 - **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，怀疑边存在才省略"，
   且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。`strength` 是模型的主观三档
   判断（反事实定义），聚合时建议按 strong/moderate/weak → 1.0/0.5/0.25 加权，或仅取 strong 边做硬约束。
-- **JSON 模式偶发 code-fence**：极少数情况模型无视 `json_object` 模式仍输出 ` ```json ` 围栏或
-  sectioned 文本——解析器已兜底（剥围栏 / 回退 sectioned 解析，含 `[Envchanges]`/`[Causal]` 节），不影响可用性。
+- **JSON 模式偶发 code-fence**：极少数情况模型无视 `json_object` 模式给输出套 ` ```json ` 围栏——
+  解析器会剥围栏后照常解析；模型完全脱轨输出非 JSON 文本时直接 `parse_failed`（原始输出留在
+  `raw_content`，retry 一次通常即恢复）。
 - **单 participant 单 day**：跨天/跨参与者需起多个进程，注意共享 RPM 配额（调低单进程 `--max-rpm`）。
 
 ---

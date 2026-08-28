@@ -123,9 +123,9 @@ The audio has been VOICE-ANONYMIZED (pitch/timbre shifted). Therefore:
   never by voice.
 
 # Timestamps (no watermark)
-There is no watermark. Timestamp all self_actions and others using the scene-relative clock: the
-first frame is 00:00, the last is 00:04. Each "time"/"time_end" MUST be an "MM:SS" string in
-{00:00, 00:01, 00:02, 00:03, 00:04} — never 00:05 or higher (the scene ends at 00:04).
+There is no watermark. Timestamp all self_actions and other_actions using the scene-relative
+clock: the first frame is 00:00, the last is 00:04. Each "time"/"time_end" MUST be an "MM:SS"
+string in {00:00, 00:01, 00:02, 00:03, 00:04} — never 00:05 or higher (the scene ends at 00:04).
 time <= time_end, and time_end <= 00:04.
 
 # Output format
@@ -133,56 +133,69 @@ Return ONLY a single JSON object. No explanations, no markdown code fences, no t
 Use exactly this structure (fill every field; use empty arrays/strings when a section is truly empty):
 
 {
+  "environment": {
+    "setting": "...",
+    "near_field": ["..."],
+    "background": "..."
+  },
+  "people": [
+    {"id": "P1", "descriptor": "...", "name": "", "note": ""}
+  ],
   "self_actions": [
-    {"time": "00:02", "time_end": "00:05", "text": "..."}
+    {"time": "00:02", "time_end": "00:03", "text": "..."}
   ],
-  "others": [
-    {"time": "00:02", "time_end": "00:05", "text": "..."}
+  "other_actions": [
+    {"time": "00:02", "time_end": "00:03", "person": "P1", "text": "..."}
   ],
-  "environment": "...",
   "speech": [
-    {"lang": "zh", "speaker": "...", "text": "..."}
+    {"lang": "zh", "speaker": "P1", "text": "..."}
   ],
-  "psychology": {"awareness": "low", "emotion": "...", "note": "..."},
-  "tags": ["..."]
+  "psychology": {"emotion": "...", "mental_activity": "..."}
 }
 
 ## Field rules
 
-self_actions: 1-4 objects, one per self-action, in first person ("I"), present tense, verb-led.
-Because the scene is short (5s) use a FINE granularity: break continuous behavior into small action
-units of ~1-2 seconds each (e.g. reach -> grasp -> lift). Cover the whole 5s span when there is
-enough motion; a single action object is fine if the scene is essentially static. Describe hand-object
-contact, posture, gaze direction, locomotion, device/phone use.
+environment: an object describing the scene a simulator would spawn the agent into.
+  setting: one or two sentences on the overall scene: place type, room, lighting, screen content,
+    object layout, weather/outdoor cues. In this 5s format it may also note the ONE notable scene
+    change if any (e.g. "灯在 00:02 亮起") — short scenes have no separate change layer.
+  near_field: short phrases, one per object I or others touch / hold / are about to interact with,
+    each with a rough location ("白色马克杯（桌面右手边）"). If an object cannot be confidently
+    identified, describe its observable attributes honestly (shape, size, color, material) instead
+    of guessing a category.
+  background: one short clause for the rest of the scene; empty string if nothing worth noting.
+
+people: the cast list of OTHER people visible or clearly present — never yourself. Give each a
+stable short id ("P1", "P2", ...) and ONE stable visual descriptor ("穿蓝衬衫的女性", "the man in
+the grey hoodie"); reuse the same id and descriptor everywhere. Fill "name" ONLY if a name is
+actually spoken or shown in this scene; otherwise leave it empty — never invent names. Empty
+array if I am alone.
+
+self_actions: 1-4 objects, one per self-action, in first person ("我"/"I"), present tense,
+verb-led. Because the scene is short (5s) use a FINE granularity: break continuous behavior into
+small action units of ~1-2 seconds each (e.g. reach -> grasp -> lift). Cover the whole 5s span
+when there is enough motion; a single action object is fine if the scene is essentially static.
+Describe hand-object contact, posture, gaze direction, locomotion, device/phone use.
 Each "time"/"time_end" is a scene-relative MM:SS (~1s resolution). Use Chinese when the scene is
-Chinese-speaking, English otherwise. Never invent a name for yourself; use neutral descriptors for
-others unless their name is shown or spoken.
+Chinese-speaking, English otherwise. Never invent a name for yourself.
 
-others: zero or more objects, same shape, timestamped the same way. Lead text with the person
-descriptor ("a woman in blue", "a child"). Empty array if you are alone.
+other_actions: zero or more objects, same shape and same atomicity standard as self_actions,
+timestamped the same way, plus a "person" field carrying the id from people. Lead the text with
+the person descriptor ("a woman in blue", "a child"). Empty array if I am alone.
 
-environment: one or two sentences on the setting and any CHANGES during the 5s: room, lighting,
-screen content, object layout, weather/outdoor cues, location. Empty string if perfectly static.
+speech: zero or more objects. lang in {"zh","en"}; speaker is "self" for me, otherwise the person
+id from people (a neutral visual descriptor only when unclear — never inferred from voice); text
+is the quoted utterance. Transcribe ONLY what is actually heard; do not invent. Speech is not
+timestamped. Empty array if silent. If the audio is non-speech (music, noise), describe it in
+environment.setting instead.
 
-speech: zero or more objects. lang in {"zh","en"}; speaker is a NEUTRAL visual descriptor only (never
-inferred from voice); text is the quoted utterance. Transcribe ONLY what is actually heard; do not
-invent. Speech is not timestamped. Empty array if silent. If the audio is non-speech (music, noise),
-describe it in environment or tags instead.
-
-psychology: an object with exactly:
-  awareness: "low" | "medium" | "high"  (required)
-  emotion: one or two lowercase keywords (required; "neutral" if none readable)
-  note: optional short sentence
-"awareness" measures how strongly emotion CAUSALLY drove visible behavior in this 5s scene:
-  low    = emotion was background color; behavior was driven by habit or task, not by feeling.
-  medium = emotion colored HOW an action was performed (tone, pace, expression, vigor) but did not
-           change its direction.
-  high   = emotion directly triggered a behavior or a turn/pivot (e.g. surprise -> turning head).
-"emotion" picks from: neutral calm relaxed bored focused amused happy excited surprised confused
-curious anxious nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
-
-tags: 5-10 short lowercase keywords (objects, actions, location, people descriptors). MANDATORY,
-never empty.
+psychology: an object with exactly two keys, estimated AS IF THIS SCENE WERE YOUR ONLY EVIDENCE:
+  emotion: one or two lowercase keywords (required; "neutral" if none readable), picked from:
+    neutral calm relaxed bored focused amused happy excited surprised confused curious anxious
+    nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
+  mental_activity: one or two short sentences of plausible ongoing thought, in first person —
+    the ONLY field where intent may appear. Ground it in the visible situation; an honest
+    "无特别线索" beats an invented agenda.
 
 # Rules
 - Stay strictly within this 5-second scene; never describe other scenes or invent off-screen events.
@@ -197,7 +210,7 @@ USER_TASK_TMPL_ARL = (
     "There are 5 frames at 1fps (frame 0 = scene second 00:00, frame 4 = 00:04) and one 5-second "
     "audio clip. The audio is voice-anonymized: transcribe what is said but do NOT infer speaker "
     "identity, gender, or emotion from the voice quality.\n"
-    "Timestamp self_actions and others with the scene-relative MM:SS clock (00:00-00:04)."
+    "Timestamp self_actions and other_actions with the scene-relative MM:SS clock (00:00-00:04)."
 )
 
 
@@ -735,7 +748,7 @@ def main():
     # --- Stats ---
     all_usage, all_records, all_failures = [], [], []
     outcome_counts = {OUTCOME_OK: 0, OUTCOME_SAFETY: 0, OUTCOME_PARSE_FAILED: 0,
-                      OUTCOME_EMPTY: 0, "fallback_sectioned": 0,
+                      OUTCOME_EMPTY: 0,
                       "images_only_fallback": 0, "first_attempt_rejection": 0}
     skipped_existing = 0
     t_start = time.time()

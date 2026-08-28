@@ -474,22 +474,15 @@ def split_source_into_slices(src: Path, clip_id: str, base_hms: str, target_s: i
 # ===========================================================================
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
-_TS_RANGE_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})(?:\s*-\s*(\d{2}:\d{2}:\d{2}))?\s*(.*)$")
-_SPEECH_RE = re.compile(r"^\[(zh|en|other)\]\s*(.*)$", re.IGNORECASE)
-_SECTION_HEADERS = ("Self", "Others", "Environment", "Envchanges", "Causal", "Speech", "Psychology", "Ocr", "Tags")
-_QUOTE_PAIRS = str.maketrans({"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"})
 
 _ANNOTATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "environment": {"anyOf": [
-            {"type": "string"},
-            {"type": "object", "properties": {
-                "setting": {"type": "string"},
-                "near_field": {"type": "array"},
-                "background": {"type": "string"}},
-             },
-        ]},
+        "environment": {"type": "object", "properties": {
+            "setting": {"type": "string"},
+            "near_field": {"type": "array"},
+            "background": {"type": "string"}},
+        },
         "people": {"type": "array", "items": {"type": "object"}},
         "self_actions": {"type": "array", "items": {"type": "object"}},
         "other_actions": {"type": "array", "items": {"type": "object"}},
@@ -508,12 +501,6 @@ _ANNOTATION_SCHEMA = {
         # causal_links items are normalized leniently in _norm_causal (invalid/missing
         # strength -> ""), so a stray value on one edge never rejects the whole response.
         "causal_links": {"type": "array", "items": {"type": "object"}},
-        # Legacy single-turn/ARL shapes ("others", "ocr", string environment,
-        # psychology.note/awareness, tags) also validate; normalization maps them
-        # onto the canonical fields below.
-        "others": {"type": "array", "items": {"type": "object"}},
-        "ocr": {"type": "array", "items": {"type": "object"}},
-        "tags": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["self_actions", "psychology"],
 }
@@ -526,163 +513,10 @@ class ParseFailed(Exception):
         self.raw = raw
 
 
-def _strip_bullet(ln: str) -> str:
-    return re.sub(r"^[-*\u2022\u2013]+\s*", "", ln).strip()
-
-
-def _split_sections(text: str) -> dict:
-    sections: dict = {}
-    current = None
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        header = None
-        m = re.match(r"^(?:#+\s*)?\[?\s*([A-Za-z]+)\s*\]?\s*:\s*$", line)
-        if m and m.group(1).capitalize() in _SECTION_HEADERS:
-            header = m.group(1).capitalize()
-        if header is None:
-            m2 = re.match(r"^(?:#+\s*)?\[\s*([A-Za-z]+)\s*\]$", line)
-            if m2 and m2.group(1).capitalize() in _SECTION_HEADERS:
-                header = m2.group(1).capitalize()
-        if header is not None:
-            current = header
-            sections.setdefault(current, [])
-            continue
-        if current is not None:
-            sections.setdefault(current, []).append(line)
-    return sections
-
-
-def _parse_actions(lines: list) -> list:
-    out = []
-    for ln in lines:
-        ln = _strip_bullet(ln)
-        if not ln:
-            continue
-        m = _TS_RANGE_RE.match(ln)
-        if m and re.fullmatch(r"\d{2}:\d{2}:\d{2}", m.group(1)):
-            out.append({"time": m.group(1), "time_end": m.group(2) or "", "text": m.group(3).strip()})
-        else:
-            out.append({"time": "", "time_end": "", "text": ln})
-    return out
-
-
-def _parse_speech(lines: list) -> list:
-    out = []
-    for ln in lines:
-        ln = _strip_bullet(ln).translate(_QUOTE_PAIRS)
-        if not ln:
-            continue
-        m = _SPEECH_RE.match(ln)
-        if m:
-            lang = m.group(1).lower()
-            rest = m.group(2).strip()
-            speaker = ""
-            sm = re.match(r'^([^:"]+?):\s*(.*)$', rest)
-            if sm and sm.group(2).startswith('"'):
-                speaker = sm.group(1).strip()
-                rest = sm.group(2).strip()
-            qm = re.match(r'^"([^"]*)"', rest)
-            text = qm.group(1) if qm else rest.strip('"').strip()
-            out.append({"lang": lang, "speaker": speaker, "text": text})
-        else:
-            out.append({"lang": "", "speaker": "", "text": ln})
-    return out
-
-
-def _parse_psychology(lines: list) -> dict:
-    psych = {"emotion": "", "mental_activity": ""}
-    for ln in lines:
-        ln = _strip_bullet(ln)
-        if not ln:
-            continue
-        low = ln.lower()
-        if low.startswith("emotion"):
-            psych["emotion"] = ln.split(":", 1)[-1].strip().lower().strip("`*")
-        elif low.startswith(("mental", "note")):
-            psych["mental_activity"] = ln.split(":", 1)[-1].strip()
-    return psych
-
-
-_OCR_WHERE_TOKENS = ("whiteboard", "paper", "screen", "sign", "other", "blackboard",
-                     "monitor", "laptop", "phone", "poster", "book", "label", "package")
-
-
-def _parse_ocr(lines: list) -> list:
-    """Parse an [Ocr] fallback section. Each line may be:
-      - `where: "text"` (e.g. `whiteboard: "会议安排"`)
-      - `where - text` / `where | text`
-      - bare text (where defaults to "")
-    """
-    out = []
-    for ln in lines:
-        ln = _strip_bullet(ln).translate(_QUOTE_PAIRS)
-        if not ln:
-            continue
-        where, text = "", ln
-        m = re.match(r"^([A-Za-z]+)\s*[:\-|]\s*(.+)$", ln)
-        if m and m.group(1).lower() in _OCR_WHERE_TOKENS:
-            where = m.group(1).lower()
-            text = m.group(2).strip().strip('"').strip()
-        else:
-            text = ln.strip().strip('"').strip()
-        out.append({"where": where, "text": text, "note": ""})
-    return out
-
-
 _CAUSAL_TYPES = ("env->action", "env->emotion", "emotion->action", "action->env",
                  "other->action", "other->env", "other->emotion", "env->env")
 # Edge strength grades each causal link counterfactually (weak/moderate/strong).
 _STRENGTH_LEVELS = ("strong", "moderate", "weak")
-
-
-def _parse_causal(lines: list) -> list:
-    """Parse a [Causal] fallback section. Lines look like:
-      `env->action: 11:10:15 手机震动 -> 11:10:16 我拿起手机 (strong)`
-    Type is the token before the colon; cause/effect split on '->' (or '=>' / '→');
-    an optional '(strong|moderate|weak)' anywhere in the line grades the edge."""
-    out = []
-    for ln in lines:
-        ln = _strip_bullet(ln).translate(_QUOTE_PAIRS)
-        if not ln:
-            continue
-        strength = ""
-        sm = re.search(r"\(\s*(strong|moderate|weak)\s*\)", ln, re.IGNORECASE)
-        if sm:
-            strength = sm.group(1).lower()
-            ln = (ln[: sm.start()] + ln[sm.end():]).strip()
-        typ, rest = "", ln
-        m = re.match(r"^\[?([a-z]+->[a-z]+)\]?\s*[:：]\s*(.+)$", ln)
-        if m and m.group(1) in _CAUSAL_TYPES:
-            typ, rest = m.group(1), m.group(2).strip()
-        cause, effect = rest, ""
-        for sep in ("->", "=>", "\u2192"):
-            if sep in rest:
-                cause, effect = (p.strip() for p in rest.split(sep, 1))
-                break
-        out.append({"type": typ, "cause": cause, "effect": effect, "strength": strength})
-    return out
-
-
-def parse_layered_caption(text: str) -> dict:
-    """Fallback parser for sectioned text (used if the model ignores json_object
-    mode and emits [Self]/[Psychology] style output). Returns the same dict shape
-    as parse_json_caption; legacy section names map onto the canonical fields."""
-    sections = _split_sections(text)
-    return {
-        "environment": {"setting": " ".join(sections.get("Environment", [])).strip(),
-                        "near_field": [], "background": ""},
-        "people": [],
-        "self_actions": _parse_actions(sections.get("Self", [])),
-        "other_actions": [dict(a, person="") for a in _parse_actions(sections.get("Others", []))],
-        "env_changes": [dict(e, cause="") for e in _parse_actions(sections.get("Envchanges", []))],
-        "speech": _parse_speech(sections.get("Speech", [])),
-        "sound": [],
-        "interface": [dict(o, time="", app_or_site="") for o in _parse_ocr(sections.get("Ocr", []))],
-        "psychology": _parse_psychology(sections.get("Psychology", [])),
-        "causal_links": _parse_causal(sections.get("Causal", [])),
-    }
 
 
 def parse_json_caption(content: str) -> dict:
@@ -766,27 +600,24 @@ def parse_json_caption(content: str) -> dict:
                 "effect": str(c.get("effect", "") or ""), "strength": strength}
 
     psych = data.get("psychology") or {}
-    env = data.get("environment", "") or ""
+    env = data.get("environment") or {}
     if isinstance(env, dict):
         environment = {"setting": str(env.get("setting", "") or ""),
                        "near_field": [str(x) for x in (env.get("near_field") or []) if str(x).strip()],
                        "background": str(env.get("background", "") or "")}
-    else:  # legacy single-field responses (ARL prompt)
-        environment = {"setting": str(env), "near_field": [], "background": ""}
-    raw_others = data.get("other_actions") or data.get("others") or []
-    raw_iface = data.get("interface") or data.get("ocr") or []
+    else:  # unreachable under jsonschema; keeps the no-jsonschema path safe
+        environment = {"setting": "", "near_field": [], "background": ""}
     return {
         "environment": environment,
         "people": [_norm_person(p) for p in data.get("people", []) or []],
         "self_actions": [_norm_action(a) for a in data.get("self_actions", []) or []],
-        "other_actions": [_norm_other(a) for a in raw_others],
+        "other_actions": [_norm_other(a) for a in data.get("other_actions", []) or []],
         "env_changes": [_norm_env_change(e) for e in data.get("env_changes", []) or []],
         "speech": [_norm_speech(s) for s in data.get("speech", []) or []],
         "sound": [_norm_sound(s) for s in data.get("sound", []) or []],
-        "interface": [_norm_interface(o) for o in raw_iface],
+        "interface": [_norm_interface(o) for o in data.get("interface", []) or []],
         "psychology": {"emotion": str(psych.get("emotion", "") or ""),
-                       "mental_activity": str(psych.get("mental_activity", "")
-                                              or psych.get("note", "") or "")},
+                       "mental_activity": str(psych.get("mental_activity", "") or "")},
         "causal_links": [_norm_causal(c) for c in data.get("causal_links", []) or []],
     }
 
@@ -800,14 +631,13 @@ OUTCOME_EMPTY = "empty"
 
 def classify_output(content: str, out_tokens: int) -> str:
     """Cheap pre-classification (does not parse). The actual JSON parse is
-    attempted in build_records_from_response so it can capture the fallback."""
+    attempted in build_records_from_response."""
     if not content or not content.strip():
         return OUTCOME_EMPTY
     if out_tokens <= 25:
-        stripped = content.strip()
-        has_structure = (stripped.startswith("{") or "[Self]" in stripped
-                         or "emotion" in stripped.lower() or '"psychology"' in stripped)
-        if not has_structure:
+        # JSON-mode output must start with the object (a fence is tolerated —
+        # the parser strips it). Anything else that short is a refusal.
+        if not content.strip().startswith(("{", "```")):
             return OUTCOME_SAFETY
     return OUTCOME_OK
 
@@ -843,8 +673,7 @@ class CaptionRecord:
     causal_links: list = None    # [{type, cause, effect, strength}] — strength-graded directed
                                  # env<->action<->emotion/env edges
     clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
-    output_format: str = "json"  # "json" | "fallback_sectioned"
-    recovery: str = ""           # "ok" | "fallback_sectioned" | "10s_slices"
+    recovery: str = ""           # "ok" | "10s_slices"
 
 
 @dataclass
@@ -918,22 +747,11 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
 
     try:
         layered = parse_json_caption(content)
-        output_format = "json"
     except ParseFailed:
-        # Fallback: maybe sectioned text despite json_mode.
-        if "[Self]" in content or "[Psychology]" in content:
-            try:
-                layered = parse_layered_caption(content)
-                output_format = "fallback_sectioned"
-            except Exception:
-                return None, UsageRecord(clip_id, gid, attempt, round(latency, 3),
-                                         OUTCOME_PARSE_FAILED, usage, content)
-        else:
-            return None, UsageRecord(clip_id, gid, attempt, round(latency, 3),
-                                     OUTCOME_PARSE_FAILED, usage, content)
+        return None, UsageRecord(clip_id, gid, attempt, round(latency, 3),
+                                 OUTCOME_PARSE_FAILED, usage, content)
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    recovery = "fallback_sectioned" if output_format == "fallback_sectioned" else "ok"
     cap_rec = CaptionRecord(
         clip_id=clip_id, global_idx=gid, day=int(clip_row["day"]), user=clip_row["user"],
         duration_s=float(clip_row["duration"]), narrative=content.strip(),
@@ -944,7 +762,7 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         env_changes=layered["env_changes"], speech=layered["speech"],
         sound=layered["sound"], interface=layered["interface"],
         psychology=layered["psychology"], causal_links=layered["causal_links"],
-        clip_kind=clip_row.get("clip_kind", "30s"), output_format=output_format, recovery=recovery,
+        clip_kind=clip_row.get("clip_kind", "30s"), recovery="ok",
     )
     use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), recovery, usage)
     return cap_rec, use_rec
@@ -1482,7 +1300,7 @@ def main():
                          "for ~4x cheaper/faster runs (causal_links quality drops). "
                          "Under thinking Mimo ignores temperature/top_p.")
     ap.add_argument("--no-json-mode", action="store_true",
-                    help="disable response_format=json_object (debug; falls back to sectioned parser)")
+                    help="disable response_format=json_object (debug)")
     # --- Concurrency ---
     ap.add_argument("--max-rpm", type=int, default=90, help="global RPM cap (Mimo limit is 100)")
     ap.add_argument("--api-workers", type=int, default=6)
@@ -1627,7 +1445,7 @@ def main():
     # --- Stats ---
     all_usage, all_records, all_failures = [], [], []
     outcome_counts = {OUTCOME_OK: 0, OUTCOME_SAFETY: 0, OUTCOME_PARSE_FAILED: 0,
-                      OUTCOME_EMPTY: 0, "fallback_sectioned": 0, "10s_slices": 0,
+                      OUTCOME_EMPTY: 0, "10s_slices": 0,
                       "first_attempt_rejection": 0}
     skipped_existing = 0
     t_start = time.time()
@@ -1829,7 +1647,6 @@ def main():
         "n_safety_rejection": outcome_counts[OUTCOME_SAFETY],
         "n_parse_failed": outcome_counts[OUTCOME_PARSE_FAILED],
         "n_empty": outcome_counts[OUTCOME_EMPTY],
-        "n_fallback_sectioned": outcome_counts["fallback_sectioned"],
         "n_recovery_10s": outcome_counts["10s_slices"],
         "n_first_attempt_rejection": outcome_counts["first_attempt_rejection"],
         "elapsed_s": round(elapsed, 2),
