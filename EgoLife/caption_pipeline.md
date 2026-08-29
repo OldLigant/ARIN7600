@@ -21,12 +21,12 @@
 |---|---|---|---|
 | **环境（整体）** | `environment` | `{setting, near_field[], background}`：整体场景说明 + **近场物体清单**（我/他人可能交互的东西，模拟器据此 spawn 道具）+ 其余背景一笔。near_field 的物体标签即全片段唯一命名（对象锚定，识别不了就如实描述外观，不猜类别）；场景说明而非变化日志 | ❌（整段） |
 | **人物表** | `people` | 画面中出现的**其他人**花名册（不含自己）：`{id: "P1", descriptor, name, note}`；id 与 descriptor 全片段复用；`name` 仅当场说出/显示才填，不臆造 | ❌ |
-| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤）；只写可观察动作——意图只能进 psychology | ✅ 读视频**左上角**水印 `HH:MM:SS:FF`，标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率）；视频按 2fps 采样，**按水印读时间、严禁数帧推算**，帧间跳变不臆补中间微步 |
+| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤）；走路/转身/坐下/环顾等无宾语动作本身即合法原子动作，不硬凑宾语；只写可观察动作——意图只能进 psychology | ✅ 读视频**左上角两行水印**（第 1 行 `HH:MM:SS:FF`、第 2 行 `DAYn`），标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率）；**右上角是佩戴者 id**（如 A1_JAKE），不作为场景文本转写；视频按 2fps 采样（含音轨），**按水印读时间、严禁数帧推算**，帧间跳变不臆补中间微步 |
 | **他人行为** | `other_actions` | 其他人做了什么；同原子化标准，`person` 字段引用 people.id，文本以 descriptor 开头 | ✅ 同一时间轴 |
 | **环境变化** | `env_changes` | 片段内可观察的**原子状态迁移**：物体出现/消失/移动、设备状态改变（屏幕亮/灭、门开、瓶盖拧开）、光线变化、人进出画面；`cause ∈ {self, other, external}` 归因（other 时文中点名人物 id） | ✅ 同一时间轴 |
 | **语音** | `speech` | 关键话语；`lang` + 说话人（`self` 或 people.id，听不清时短描述）+ 引号文本 | ❌（音视不严格对齐，不强求） |
 | **声音** | `sound` | 离散**非语音**声音：提示音、铃声、键盘、门响、脚步、笑声咳嗽等；`{time?, text, source}`——仅当时刻可被画面锚定（手机亮屏同时响）才标 time；持续环境音写进 environment | ⚠️ 可选（视觉锚定时才有 time） |
-| **界面** | `interface` | **条件触发**：画面出现屏幕（手机/笔记本/电视…）或大量可读文字表面（白板/纸/招牌）才填。屏幕不止 OCR：识别 app/网站 + 页面类型 + 关键可见内容（bilibili 标题+UP主、知乎问题+回答、文件管理器路径文件名、聊天最新消息…）；内容中途变化时新增带 time 的条目。**不转写时间水印。** | ✅（页面变化时标 time） |
+| **界面** | `interface` | **条件触发**：画面出现屏幕（手机/笔记本/电视…）或大量可读文字表面（白板/纸/招牌）才填。屏幕不止 OCR：识别 app/网站 + 页面类型 + 关键可见内容（bilibili 标题+UP主、知乎问题+回答、文件管理器路径文件名、聊天最新消息…）；内容中途变化时新增带 time 的条目。**不转写时间水印与右上角佩戴者 id。** | ✅（页面变化时标 time） |
 | **心理** | `psychology` | `{emotion, mental_activity}`，仅凭本片段推断（当作唯一证据）；`mental_activity` 是**全 schema 唯一允许出现意图/计划**的字段（第一人称正在想什么、接下来要做什么），无线索时如实写"无特别线索" | 整段一个 |
 | **因果边** | `causal_links` | 有向因果边 `{type, cause, effect, strength}`，8 种类型见下 | cause/effect 短语内嵌时间 |
 
@@ -231,11 +231,11 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 ### 字段说明
 - `environment`：`{setting, near_field[], background}`，模拟器放置 agent 的场景上下文；near_field 列我/他人可能交互的近场物体（带粗略方位），标签即全片段唯一命名——同一物体在各字段中逐字复用，识别不自信时如实描述外观属性而不猜类别。片段内的变化不写在这里（变化进 `env_changes`）。
 - `people`：`[{id, descriptor, name, note}]`，画面中其他人的花名册（不含自己）；`id`（"P1"…）与 `descriptor` 全片段复用，`name` 仅当场说出/显示才填。独自一人时为 `[]`。
-- `self_actions` / `other_actions`：`[{time, time_end, (person,) text}]`，`time` 为水印时间戳；无时间戳的行 `time=""` 但仍保留。**原子化**：一条 = 一个动词级步骤，复合行为拆开，无数量配额。`other_actions.person` 引用 `people.id`；只写可观察动作——意图只能进 `psychology.mental_activity`。
+- `self_actions` / `other_actions`：`[{time, time_end, (person,) text}]`，`time` 为水印时间戳；无时间戳的行 `time=""` 但仍保留。**原子化**：一条 = 一个动词级步骤，复合行为拆开，无数量配额；走路/转身/坐下/环顾等位移与姿态动作无需宾语，不硬凑。`other_actions.person` 引用 `people.id`；只写可观察动作——意图只能进 `psychology.mental_activity`。
 - `env_changes`：`[{time, time_end, text, cause}]`，片段内每次可观察的原子状态迁移；`cause ∈ {self, other, external}`（`other` 时文中点名人物 id；`external` = 无可见行为主体：自动门、天气、定时器）。
 - `speech`：`[{lang, speaker, text}]`，`lang ∈ {zh, en, ""}`；`speaker` 为 `self` 或 `people.id`（听不清时用短描述）。
 - `sound`：`[{time, text, source}]`，离散非语音声音；`time` 仅在时刻可被画面锚定时才有（否则 `""`），持续环境音属于 `environment.setting`。
-- `interface`：`[{time, where, app_or_site, content, note}]`，条件触发层：屏幕做**页面级理解**（app/网站 + 页面类型 + 关键可见内容逐字），实体文字表面做转写；内容中途变化新增条目。无屏幕/文字表面时为 `[]`。**不转写时间水印。**
+- `interface`：`[{time, where, app_or_site, content, note}]`，条件触发层：屏幕做**页面级理解**（app/网站 + 页面类型 + 关键可见内容逐字），实体文字表面做转写；内容中途变化新增条目。无屏幕/文字表面时为 `[]`。**不转写时间水印与右上角佩戴者 id。**
 - `psychology`：`{emotion, mental_activity}`，仅凭本片段推断（当唯一证据）；`mental_activity`（第一人称一两句）是全 schema **唯一**允许出现意图/计划的字段，缺失线索时如实写"无特别线索"而非编造。环境/他人动了情绪时，同时在 `causal_links` 记 `env->emotion` / `other->emotion` 边。
 - `causal_links`：`[{type, cause, effect, strength}]`，`type` 为 8 种边之一（见第 1 节表）；`cause`/`effect` 为带时间的短语，指向具体的原子动作/变化；`strength ∈ {strong, moderate, weak}`（反事实三档，见第 1 节；模型漏写或写非法值时宽松归一化为 `""`，不整单拒绝）；空数组合法（无可辩护的因果边时）。
 - `narrative`：模型原始 JSON 全文（未解析），保完整以便人工核查/重新解析。

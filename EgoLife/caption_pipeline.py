@@ -104,19 +104,22 @@ environment feeds back into both.
 The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
 
 # Clip sampling (CRITICAL)
-The clip is downsampled to 2 fps: you receive roughly 2 frames per second. Motion between
-consecutive frames can JUMP — hands and objects may teleport between samples. Always read
-timestamps from the watermark, never by counting frames. Fast gestures may be only partially
-captured: describe the visible endpoints honestly and do NOT interpolate unobserved intermediate
-micro-steps. If an object appears or disappears between two samples, timestamp the change with
-the first frame where the new state is visible.
+Each clip runs about 10 seconds (never more than ~30s), is downsampled to 2 fps — you receive
+roughly 2 frames per second — and comes WITH its audio track; use what you hear for the speech
+and sound fields. Covering the whole clip is expected.
+Motion between consecutive frames can JUMP — hands and objects may teleport between samples.
+Always read timestamps from the watermark, never by counting frames. Fast gestures may be only
+partially captured: describe the visible endpoints honestly and do NOT interpolate unobserved
+intermediate micro-steps. If an object appears or disappears between two samples, timestamp the
+change with the first frame where the new state is visible.
 
 # Watermark anchor (CRITICAL)
-Every video frame carries a watermark in the TOP-LEFT corner showing the current time and day,
-formatted "HH:MM:SS:FF DAYn" (e.g. "11:10:02:00 DAY1"). FF is a frame counter 00-19.
+Every video frame carries a watermark in the TOP-LEFT corner, on two lines: line 1 is
+"HH:MM:SS:FF" (e.g. "11:09:42:12"; FF is a frame counter 00-19), line 2 is the day label
+"DAYn" (e.g. "DAY1"). A wearer id (e.g. "A1_JAKE") sits in the TOP-RIGHT corner.
 The user message tells you the day label and the approximate start time of this clip.
 You MUST read the watermark to timestamp the actions and changes you describe, so they can be
-located on a timeline. Never transcribe the watermark itself as screen text.
+located on a timeline. Never transcribe either the watermark or the wearer id as scene text.
 
 # Output format
 Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
@@ -158,11 +161,13 @@ Use exactly this structure (fill every field; use empty arrays/strings when a se
 ## Field rules
 
 environment: an object with three sub-fields describing the scene a simulator would spawn the
-agent into — it should read like a scene description, NOT a changelog. In-clip CHANGES belong in
-env_changes, not here (a location transition appears both as a one-clause note in "setting" and
-as env_changes entries).
+agent into — it should read like a scene description, NOT a changelog. This is a SNAPSHOT, so no
+sub-field carries timestamps: anything time-stamped about the scene (an object appears, moves,
+is picked up; lighting shifts) belongs in env_changes.
   setting: one or two sentences on the OVERALL stable backdrop the clip happens in: place type,
-    room layout, lighting, weather / indoor-outdoor cues, ambient soundscape.
+    room layout, lighting, weather / indoor-outdoor cues, ambient soundscape. If I move between
+    rooms mid-clip, describe the STARTING scene here and add one short clause naming the
+    destination ("片段末尾我走进厨房"); the transition itself is recorded as env_changes entries.
   near_field: an array of short phrases, one per notable NEAR-FIELD object — things I or others
     touch, hold, or are likely to interact with (on the desk, in hand, within arm's reach) —
     each with a rough location ("白色马克杯（桌面右手边）", "laptop, open, directly ahead").
@@ -184,8 +189,10 @@ this clip; otherwise leave it empty — never invent names. "note" is optional: 
 to me, role cues, partial visibility ("只在画面右侧边缘出现"). Empty array if I am alone.
 
 self_actions: one object per ATOMIC self-action, in first person ("我"), present tense, verb-led.
-An atomic action is a single verb-level step with one object and one immediate goal: reach, grasp,
-pick up, put down, open, close, turn on, flip, slide, look at, walk to, sit down. DECOMPOSE compound
+An atomic action is a single verb-level step with one immediate goal: reach, grasp, pick up, put
+down, open, close, turn on, flip, slide, look at, walk, turn around, sit down, stand up. A target
+object is USUAL but NOT required — locomotion, posture and gaze actions (走路, 转身, 坐下, 环顾)
+are valid atomic actions on their own; do not force an object onto them. DECOMPOSE compound
 behavior: "我拿起手机划开屏幕看消息" must become at least "我拿起手机" + "我划开屏幕" + "我低头浏览消息".
 Conversely, do NOT split one continuous gesture into artificial micro-frames, and do NOT merge
 separate manipulations into one entry. There is NO count quota — atomicity is the standard, not
@@ -208,13 +215,14 @@ array if I am alone.
 env_changes: one object per ATOMIC observable state change of the environment DURING this clip:
 an object appears / disappears / moves; a device or aperture changes state (screen lights up or
 sleeps, door opens, cap comes off, cup empties); lighting or soundscape shifts; layout is
-rearranged; a person enters or leaves the scene. Even in a short clip the environment is a
-stateful actor, not a static backdrop — report every discrete transition you can see. Timestamp
-each entry like an action. Every entry carries "cause": "self" (my action did it), "other"
-(another person did it — name their id in the text), or "external" (no visible agent — automatic
-door, weather, a timer). Changes are the object-level mirror of actions: if I pick up a cup, the
-pick-up is a self_action AND "杯子离开桌面进入我手中" is an env_change with cause "self". Only
-report changes actually visible in this clip. Empty array if the environment truly does not change.
+rearranged; a person enters or leaves the scene; the camera moves into a different room. Even in
+a short clip the environment is a stateful actor, not a static backdrop — report every discrete
+transition you can see. Timestamp each entry like an action. Every entry carries "cause": "self"
+(my action did it), "other" (another person did it — name their id in the text), or "external"
+(no visible agent — automatic door, weather, a timer). Changes are the object-level mirror of
+actions: if I pick up a cup, the pick-up is a self_action AND "杯子离开桌面进入我手中" is an
+env_change with cause "self". Only report changes actually visible in this clip. Empty array if
+the environment truly does not change.
 
 speech: zero or more objects. lang in {"zh","en"}; speaker is "self" for me, otherwise the person
 id from people (or a short descriptor when unclear); text is the quoted utterance. Transcribe only
@@ -242,8 +250,8 @@ appears. For SCREENS, go beyond raw OCR: identify and understand the page —
 For physical text surfaces, transcribe what is legible, verbatim. When the on-screen content
 changes mid-clip (app switch, new page, a scroll that reveals a new section), add a NEW entry
 anchored with its "time". "note" records legibility caveats ("标题只露出前半句", "screen partially
-off-frame"). Do NOT transcribe the top-left time watermark. Transcribe only what is actually
-legible; never invent. Empty array if no screen or text surface appears.
+off-frame"). Do NOT transcribe the top-left watermark or the top-right wearer id. Transcribe only
+what is actually legible; never invent. Empty array if no screen or text surface appears.
 
 psychology: an object with exactly two keys, estimated AS IF THIS CLIP WERE YOUR ONLY EVIDENCE —
 ignore anything that might have happened before it. The question is: "considering only this
@@ -304,18 +312,20 @@ action / change texts (with their times) rather than vague summaries.
 USER_TASK_TMPL = (
     "Annotate this {duration_desc} first-person video ({clip_id}) and return the JSON object.\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
-    "The clip is downsampled to 2 fps: read the top-left watermark (HH:MM:SS:FF {day_label}) to "
-    "timestamp self_actions, other_actions, env_changes, and any visually anchored sounds or screen "
-    "page changes — never time anything by counting frames. Cover the full segment from {start_hms} onward.\n"
+    "The clip is downsampled to 2 fps with its audio track included: read the top-left watermark "
+    "(HH:MM:SS:FF / {day_label}, two lines) to timestamp self_actions, other_actions, env_changes, "
+    "and any visually anchored sounds or screen page changes — never time anything by counting "
+    "frames. Cover the full segment from {start_hms} onward.\n"
     "Describe the scene as setting + near-field objects + background, and list the people present. "
-    "Decompose what happens into ATOMIC actions and ATOMIC environment state changes — there is NO "
-    "count quota; atomicity is the standard. Transcribe speech, log notable non-speech sounds, and "
-    "for any screen on camera identify the app/site, the page type and its key visible text "
-    "(bilibili 视频标题 + UP主, 知乎 问题 + 回答, 文件资源管理器里的文件名, ...). Keep actions "
-    "strictly observable — intent belongs only in psychology.mental_activity. Then record every "
-    "causal edge you can defend from the clip itself: env->action, env->emotion, emotion->action, "
-    "action->env, other->action, other->env, other->emotion, env->env — each graded strength "
-    "strong/moderate/weak by how strongly the cause drove the effect."
+    "Decompose what happens into ATOMIC actions (locomotion and posture actions like 走路 / 转身 "
+    "need no object) and ATOMIC environment state changes — there is NO count quota; atomicity is "
+    "the standard. Transcribe speech, log notable non-speech sounds, and for any screen on camera "
+    "identify the app/site, the page type and its key visible text (bilibili 视频标题 + UP主, "
+    "知乎 问题 + 回答, 文件资源管理器里的文件名, ...). Keep actions strictly observable — intent "
+    "belongs only in psychology.mental_activity. Then record every causal edge you can defend from "
+    "the clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
+    "other->env, other->emotion, env->env — each graded strength strong/moderate/weak by how "
+    "strongly the cause drove the effect."
 )
 
 
@@ -499,7 +509,8 @@ _ANNOTATION_SCHEMA = {
             "required": ["emotion"],
         },
         # causal_links items are normalized leniently in _norm_causal (invalid/missing
-        # strength -> ""), so a stray value on one edge never rejects the whole response.
+        # type or strength -> ""), so a stray value on one edge never rejects the whole
+        # response; same closed-set cleanup for env_changes.cause and speech.lang.
         "causal_links": {"type": "array", "items": {"type": "object"}},
     },
     "required": ["self_actions", "psychology"],
@@ -515,6 +526,8 @@ class ParseFailed(Exception):
 
 _CAUSAL_TYPES = ("env->action", "env->emotion", "emotion->action", "action->env",
                  "other->action", "other->env", "other->emotion", "env->env")
+_ENV_CAUSES = ("self", "other", "external")
+_SPEECH_LANGS = ("zh", "en")
 # Edge strength grades each causal link counterfactually (weak/moderate/strong).
 _STRENGTH_LEVELS = ("strong", "moderate", "weak")
 
@@ -555,7 +568,10 @@ def parse_json_caption(content: str) -> dict:
     def _norm_speech(s):
         if not isinstance(s, dict):
             return {"lang": "", "speaker": "", "text": str(s)}
-        return {"lang": str(s.get("lang", "") or ""), "speaker": str(s.get("speaker", "") or ""),
+        lang = str(s.get("lang", "") or "").strip().lower()
+        if lang not in _SPEECH_LANGS:
+            lang = ""
+        return {"lang": lang, "speaker": str(s.get("speaker", "") or ""),
                 "text": str(s.get("text", "") or "")}
 
     def _norm_person(p):
@@ -587,16 +603,22 @@ def parse_json_caption(content: str) -> dict:
     def _norm_env_change(e):
         if not isinstance(e, dict):
             return {"time": "", "time_end": "", "text": str(e), "cause": ""}
+        cause = str(e.get("cause", "") or "").strip().lower()
+        if cause not in _ENV_CAUSES:
+            cause = ""
         return {"time": str(e.get("time", "") or ""), "time_end": str(e.get("time_end", "") or ""),
-                "text": str(e.get("text", "") or ""), "cause": str(e.get("cause", "") or "")}
+                "text": str(e.get("text", "") or ""), "cause": cause}
 
     def _norm_causal(c):
         if not isinstance(c, dict):
             return {"type": "", "cause": str(c), "effect": "", "strength": ""}
+        typ = str(c.get("type", "") or "").strip().lower()
+        if typ not in _CAUSAL_TYPES:
+            typ = ""
         strength = str(c.get("strength", "") or "").strip().lower()
         if strength not in _STRENGTH_LEVELS:
             strength = ""
-        return {"type": str(c.get("type", "") or ""), "cause": str(c.get("cause", "") or ""),
+        return {"type": typ, "cause": str(c.get("cause", "") or ""),
                 "effect": str(c.get("effect", "") or ""), "strength": strength}
 
     psych = data.get("psychology") or {}
