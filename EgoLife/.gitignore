@@ -27,6 +27,9 @@ captions/**/_test/
 captions/**/_archive_*/
 out/_test/
 
+# --- Drafts / scratch under tmp/ (design docs, prompt drafts, one-off scripts) ---
+tmp/
+
 # --- OS/editor ---
 .DS_Store
 Thumbs.db

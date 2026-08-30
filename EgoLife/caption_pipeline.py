@@ -39,6 +39,13 @@ Usage
   python caption_pipeline.py --skip-existing
   # caption only (slices already encoded in _cache/)
   python caption_pipeline.py --skip-preprocess
+  # best-of-N: sample each clip N times, then a two-phase critic
+  # (watch-only baseline extraction + evaluation) picks the best candidate;
+  # if even the best fails the threshold, refine with guided regeneration.
+  python caption_pipeline.py --best-of-n 4 --refine-samples 2
+  # resume a best-of-N run after interruption: existing candidates in the
+  # *_candidates.jsonl sidecar are REUSED, only missing call indices are
+  # generated, and legacy single-call records are adopted as candidate 0.
 """
 from __future__ import annotations
 
@@ -326,6 +333,245 @@ USER_TASK_TMPL = (
     "the clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
     "other->env, other->emotion, env->env — each graded strength strong/moderate/weak by how "
     "strongly the cause drove the effect."
+)
+
+
+# ===========================================================================
+# Critic prompts (best-of-N two-phase: C1a baseline extraction + C1b evaluation)
+# Design record: tmp/第一人称视频标注critic提示词_v2.txt
+# ===========================================================================
+
+CRITIC_BASELINE_SYSTEM_MSG = """You build the VERIFICATION BASELINE for a first-person life-log clip. A
+separate critic pass will later judge candidate annotations of this same clip against this baseline,
+so your job is to watch the footage and write a compact, factual INDEX of what you verified happened.
+This is NOT an annotation: it is scaffolding for verification. Keep it short and stop when done.
+
+The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
+
+# Clip sampling (the same rules the annotators followed)
+Each clip runs about 10 seconds (never more than ~30s), downsampled to 2 fps, WITH audio. Motion
+between consecutive frames can JUMP — hands and objects may teleport between samples. Read timestamps
+ONLY from the top-left watermark (line 1 "HH:MM:SS:FF", line 2 "DAYn"), never by counting frames. The
+top-right corner carries the wearer id (e.g. "A1_JAKE"). Never transcribe the watermark or the wearer
+id as scene content.
+
+# What to write
+Return ONLY a JSON object with a single key "verification_baseline" containing:
+- "scene": 1-2 sentences: setting, key near-field objects, people present.
+- "near_field": short phrases, one per notable NEAR-FIELD object I or others might interact with
+  (on the desk, in hand, within arm's reach), each with a rough location ("白色马克杯（桌面右手边）").
+  This is the canonical object inventory that later verification checks renamed/invented objects
+  against. If an object cannot be confidently identified, describe its observable attributes
+  honestly — never guess a category.
+- "key_events": the rough timeline, 5-8 entries, each a SINGLE short line starting with a watermark
+  HH:MM:SS and at most ~10 words, shorthand allowed ("11:09:44 我放下杯子"). Cover the whole clip
+  span: my actions, others' actions, environment changes, people entering/leaving.
+- "audio_gist": one short line (~10 words max) per AUDIBLE event: every speech turn as
+  <speaker>(<lang>): '<gist or short quote>' ("self" for me, a short descriptor for others), AND
+  notable NON-SPEECH sounds (chime, ringtone, knock, beep, footsteps, laughter) as
+  <HH:MM:SS when visually anchored> <sound, source>.
+- "screens": ONLY when a screen or substantial legible text surface appears: one short line per
+  surface, "HH:MM:SS <device>: <app/site>" — RECORD ONLY the device and the app/site, NEVER the page
+  content; content verification happens in the critic pass, directly against the footage.
+
+# Boundaries (hard)
+- This is an INDEX, not a closed world: the critic pass re-checks the footage for anything missing
+  here, so you are NOT graded on completeness — write what you are confident of and stop.
+- NO annotation-schema fields: no people roster with ids, no cause/strength grading, no
+  mental_activity, no psychology, no causal edges.
+- Keep the WHOLE verification_baseline under ~150 words. Do not polish. One short line per entry.
+- Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
+
+{
+  "verification_baseline": {
+    "scene": "...",
+    "near_field": ["..."],
+    "key_events": ["HH:MM:SS <event>", "..."],
+    "audio_gist": ["..."],
+    "screens": ["..."]
+  }
+}
+"""
+
+CRITIC_BASELINE_USER_TASK_TMPL = (
+    "Build the verification baseline for this {duration_desc} first-person video ({clip_id}).\n"
+    "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
+    "The clip is downsampled to 2 fps with its audio track included: read the top-left watermark "
+    "(HH:MM:SS:FF / {day_label}, two lines) to timestamp key_events and visually anchored sounds or "
+    "screens — never by counting frames.\n"
+    "Watch the WHOLE clip, then write the compact verification_baseline JSON: scene, near_field "
+    "inventory, key_events timeline, audio_gist (speech turns + notable non-speech sounds), and "
+    "screens (device + app/site only, no content). Keep the entire baseline under ~150 words; "
+    "shorthand is fine; this is an index for later verification, not an annotation.\n"
+    "Return ONLY the verification_baseline JSON object.\n"
+)
+
+CRITIC_SYSTEM_MSG = """You are a STRICT annotation critic for first-person life-log captions. You receive
+the SAME video clip (with its audio track) that N candidate annotators independently described, a
+verification_baseline for this clip (built in a separate watch-only pass), and the N JSON annotations.
+Your job, in order:
+  1. review the baseline, re-watch the footage as needed, and verify each candidate against the
+     ACTUAL footage,
+  2. score every candidate on a fixed rubric,
+  3. pick the single best candidate to keep,
+  4. when even the best one is flawed, write concrete regeneration guidance that a fresh annotator
+     (who never saw any candidate) can follow to produce a better annotation.
+
+You are the last line of defense against hallucination. A fluent, detailed, well-formatted annotation
+that invents content is WORSE than a sparse but honest one. Score accordingly. Never reward verbosity;
+never punish honest uncertainty ("一个贴有标签的半透明玻璃容器，距离过近细节模糊" is GOOD annotating, not a weakness).
+
+The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
+
+# Clip sampling (the same rules the annotators followed)
+Each clip runs about 10 seconds (never more than ~30s), downsampled to 2 fps, WITH audio. Motion
+between consecutive frames can JUMP — hands and objects may teleport between samples. Annotators were
+told to describe visible endpoints honestly and NOT interpolate unobserved micro-steps: do not flag
+missing intermediate micro-steps as omissions, but DO flag invented interpolated steps as
+hallucinations. Every frame carries a watermark in the TOP-LEFT corner: line 1 "HH:MM:SS:FF" (FF is a
+frame counter 00-19), line 2 the day label "DAYn". A wearer id sits in the TOP-RIGHT corner.
+Timestamps in the candidates must be verifiable against this watermark. The watermark and wearer id
+themselves must never appear as scene text in a candidate — if one transcribes them, that is a rule
+violation.
+
+# The verification_baseline (provided with this task)
+A separate watch-only pass built "verification_baseline" for this clip: scene, a near_field object
+inventory, a key_events timeline, an audio_gist (speech turns + notable non-speech sounds), and
+screens (device + app/site only). Use it as your PRIMARY reference for what the footage shows: check
+candidate omissions and timestamps against it.
+The sketch is an index, not a closed world: a candidate claim absent from the sketch is NOT thereby
+invented — re-examine that moment in the footage before flagging a hallucination; flag only what the
+footage contradicts or fails to support.
+If verification shows the baseline itself is wrong or incomplete (a missed event, a wrong timestamp,
+a renamed object), judge the footage rather than the stale baseline entry, and record the fix in
+"baseline_corrections".
+
+# Verification protocol (follow this order)
+1. Review the baseline, then verify each candidate against the FOOTAGE — never against the other
+   candidates. Popularity is not evidence: if 3 of 4 candidates repeat the same invented detail, all
+   3 are hallucinating.
+2. Where candidates DISAGREE with each other (different object identity, different action sequence,
+   different speech wording, different timestamps), re-examine that exact moment in the footage and
+   decide who — if anyone — is right.
+
+# What to check, per candidate
+A. HALLUCINATION (the priority): every object, person, action, utterance, sound, and screen content
+   claim must be verifiable in the footage. Flag anything invented: a specific object category
+   asserted where the footage only supports observable attributes; speech that was never said (check
+   against audio_gist); sounds never heard (also check against audio_gist); screen text that is not
+   legible; actions never performed; people never present; near_field objects not in the footage.
+B. OMISSION: major atomic actions, env_changes, speech turns, or screen page changes visible in the
+   footage but missing from the candidate. Judge materiality — a missed key pick-up matters; a missed
+   micro-adjustment of posture does not.
+C. TIMESTAMP ACCURACY: spot-check several entries against the watermark. Times must fall inside the
+   clip's watermark range and match the visible moment within ~1-2s. Flag entries timed by
+   frame-counting drift or placed outside the clip range.
+D. RULE COMPLIANCE (the annotators' schema rules):
+   - atomicity: compound entries that merge separate manipulations ("我拿起手机划开屏幕看消息" as one
+     entry) OR artificial micro-splits of one continuous gesture;
+   - intent ban: 准备 / 打算 / 想要 / 试图 leaking into self_actions, other_actions, env_changes or
+     causal_links (intent belongs ONLY in psychology.mental_activity);
+   - object-name anchoring: the same object renamed between near_field / actions / env_changes /
+     causal_links (check against the baseline's near_field inventory);
+   - people ids: stable id + descriptor reused everywhere; names only when actually spoken or shown;
+   - language: one language throughout, matching the dominant spoken language;
+   - environment is a snapshot (no timestamps inside it); sound entries carry "time" only when
+     visually anchored; interface entries present only when a screen/text surface is actually visible;
+   - every action/utterance/fact output exactly once, no duplication.
+E. CAUSAL QUALITY: each causal_links edge must be visible or strongly implied by temporal order +
+   mechanism; type string must be one of the 8 allowed values; strength grading must follow the
+   counterfactual definitions (strong = trigger, moderate = shaper, weak = background). Flag
+   fabricated edges and padded weak-edge stuffing; do not penalize physical action->env edges for
+   being "strong" — that is expected.
+
+# Scoring rubric (integers 0-10 per dimension)
+  faithfulness        weight 0.40 — absence of invented content (A). Any FATAL issue caps
+                     faithfulness at 3. FATAL = invented speech, invented person, fabricated
+                     screen content, or a wholesale invented action sequence.
+  coverage           weight 0.20 — completeness of major actions / env changes / speech / interface
+                     over the whole clip span (B).
+  timestamp_accuracy weight 0.15 — watermark correctness of the spot-checked entries (C).
+  rule_compliance    weight 0.15 — atomicity, intent ban, anchoring, ids, language, schema field
+                     rules (D).
+  causal_quality     weight 0.10 — evidence-based edges, correct types, honest strength (E).
+Compute weighted_total = 0.40*faithfulness + 0.20*coverage + 0.15*timestamp_accuracy
++ 0.15*rule_compliance + 0.10*causal_quality, rounded to one decimal.
+
+# Output format
+Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
+Use exactly this structure:
+
+{
+  "baseline_corrections": [],
+  "candidates": [
+    {
+      "index": 0,
+      "scores": {
+        "faithfulness": 0,
+        "coverage": 0,
+        "timestamp_accuracy": 0,
+        "rule_compliance": 0,
+        "causal_quality": 0
+      },
+      "weighted_total": 0.0,
+      "issues": [
+        {"severity": "fatal|major|minor", "type": "hallucination|omission|timestamp|atomicity|intent_leak|naming|language|schema|causal|other", "field": "self_actions[2]", "detail": "what is wrong", "evidence": "what the footage/watermark actually shows, with HH:MM:SS when relevant"}
+      ],
+      "summary": "one-sentence verdict"
+    }
+  ],
+  "best_index": 0,
+  "needs_regeneration": false,
+  "regeneration_guidance": ""
+}
+
+## Output rules
+- "baseline_corrections": corrections to the provided verification_baseline discovered while
+  verifying candidates, each a short string "add|fix|remove: <item> — <evidence, HH:MM:SS>"
+  ("remove: 11:09:44 我放下杯子 — 画面中未发生", "add: 11:10:05 手机响铃 — 基线漏记"). Empty array
+  when the baseline holds up. Only record corrections that affect your judgment; keep them consistent
+  with the "evidence" you cite in the issues below.
+- "candidates" must contain exactly one entry per input candidate, in the input order, index starting
+  at 0. Never drop or reorder candidates.
+- "issues" may be an empty array for a clean candidate. List every fatal/major issue you found; minor
+  issues only when they are actionable. "field" points at the offending entry (e.g. "env_changes[1]",
+  "speech", "people[0].name"); use "" for candidate-wide problems.
+- "best_index" is the candidate with the highest weighted_total. Tie-break: fewer fatal issues, then
+  higher faithfulness, then lower index. NEVER merge or edit candidates — you pick one verbatim; you
+  do not write a corrected annotation yourself.
+- "needs_regeneration" is true when the best candidate's weighted_total < 7.0 OR the best candidate
+  has any fatal issue; otherwise false.
+- "regeneration_guidance": REQUIRED (non-empty) whenever needs_regeneration is true, empty string
+  otherwise. Write it in the SAME language the candidates are written in, as direct standalone
+  instructions to a fresh annotator who has NOT seen any candidate — never write "候选k" / "candidate
+  k". Be concrete and fixable:
+    * what to REMOVE: invented content, with where it was claimed ("不要写'我拿起手机'——全片段中手机
+      没有出现在画面里");
+    * what to ADD: missed events with their watermark times ("11:09:44 左右我把杯子放回桌面，补一条
+      self_action 和对应的 env_change");
+    * what to FIX: wrong timestamps, renamed objects, intent leaks, mis-graded causal edges.
+  Cover the union of the important issues across ALL candidates (the best one's flaws first), so one
+  regeneration round can fix everything at once. Keep it under ~200 words.
+- Output must be valid JSON: double quotes, no trailing commas, no comments."""
+
+CRITIC_USER_TASK_TMPL = (
+    "Critique {n_candidates} candidate annotations of this {duration_desc} first-person video ({clip_id}).\n"
+    "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
+    "A verification_baseline for this clip (built in a separate watch-only pass) is provided below — "
+    "use it as your primary reference for what the footage shows. The clip is downsampled to 2 fps "
+    "with its audio track included: verify every timestamped claim against the top-left watermark "
+    "(HH:MM:SS:FF / {day_label}, two lines) — never by counting frames.\n"
+    "Review the baseline and re-watch the footage as needed, then evaluate each candidate strictly "
+    "against the footage. The sketch is an index, not a closed world: a candidate claim absent from "
+    "the sketch is NOT thereby invented — re-examine that moment in the footage before flagging a "
+    "hallucination. Where candidates disagree, re-examine that exact moment and decide who is right. "
+    "If the baseline itself is wrong or incomplete, record the fix in baseline_corrections and judge "
+    "the footage. Then score, pick the best candidate, and — if even the best is flawed — write "
+    "regeneration_guidance for a fresh annotator.\n"
+    "Return ONLY the critique JSON object.\n\n"
+    "The verification_baseline follows:\n{baseline}\n\n"
+    "The {n_candidates} candidates follow, each wrapped in <<<CANDIDATE i>>> ... <<<END CANDIDATE i>>>:\n\n"
+    "{candidates_block}"
 )
 
 
@@ -695,7 +941,12 @@ class CaptionRecord:
     causal_links: list = None    # [{type, cause, effect, strength}] — strength-graded directed
                                  # env<->action<->emotion/env edges
     clip_kind: str = "30s"       # "30s" | "segment_open" | "10s" | "15s" | "6s" | "5s"
-    recovery: str = ""           # "ok" | "10s_slices"
+    recovery: str = ""           # "ok" | "10s_slices" | "adopted"
+    best_of_n: int = 1           # samples per clip this record came from (1 = legacy single call)
+    thinking: str = ""           # thinking config of the run that produced this record
+    critic: dict = None          # best-of-N critic sub-object: {"enabled", "baseline",
+                                 # "candidates", "evaluation", "refined"} or {"skipped":
+                                 # "single_valid"} / {"failed": "baseline_failed|critic_failed"}
 
 
 @dataclass
@@ -707,6 +958,24 @@ class UsageRecord:
     recovery: str                # "ok" | "safety_rejection" | "parse_failed" | "empty" | ...
     usage: dict
     raw_content: str = ""        # captured for non-ok outcomes, for diagnostics
+    stage: str = "generate"      # "generate" (G1) | "refine" (G2) | "baseline" (C1a) | "critic" (C1b/C2b)
+    call_index: int = -1         # sample slot index for generate/refine calls (0-based); -1 otherwise
+
+
+@dataclass
+class CandidateRecord:
+    """One best-of-N candidate annotation, persisted to the *_candidates.jsonl sidecar.
+    Keyed by (clip_id, call_index) so resume reuses existing calls and only generates
+    the missing indices."""
+    clip_id: str
+    global_idx: int
+    call_index: int              # 0-based sample slot within G1 (or G2 refine)
+    stage: str                   # "generate" | "refine"
+    narrative: str               # raw model output (full JSON text)
+    model: str
+    ts_captioned: str
+    tokens: dict
+    recovery: str = ""
 
 
 # ===========================================================================
@@ -717,28 +986,53 @@ def b64_video(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def make_user_message(video_path: Path, clip_row: pd.Series, is_10s: bool = False) -> dict:
+def _video_content(video_path: Path) -> dict:
+    return {"type": "video_url",
+            "video_url": {"url": f"data:video/mp4;base64,{b64_video(video_path)}"}, "fps": 2}
+
+
+def _meta_kwargs(clip_row: pd.Series, is_10s: bool = False) -> dict:
+    """Shared prompt metadata: clip_id / src_file / day_label / start_hms / duration_desc."""
     src = clip_row["src_file"]
     ts_raw = Path(src).stem.split("_")[-1]
     day_label = f"DAY{int(clip_row['day'])}"
     # start_hms comes from the row when available (slice-aware), else from the source filename.
     start_hms = clip_row.get("start_hms") or f"{ts_raw[0:2]}:{ts_raw[2:4]}:{ts_raw[4:6]}"
-    clip_kind = clip_row.get("clip_kind", "30s")
     target_s = int(clip_row.get("target_s", 30))
     # Duration descriptor: "~Ns-second" using the actual target (10/15/30/5/6).
     # is_10s (recovery slice) overrides to the legacy "10-second" wording for back-compat.
-    if is_10s:
-        duration_desc = "10-second"
-    else:
-        duration_desc = f"~{target_s}-second"
-    task = USER_TASK_TMPL.format(
-        clip_id=clip_row["clip_id"], src_file=src, day_label=day_label,
-        start_hms=start_hms, duration_desc=duration_desc,
-    )
-    return {"role": "user", "content": [
-        {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64_video(video_path)}"}, "fps": 2},
-        {"type": "text", "text": task},
-    ]}
+    duration_desc = "10-second" if is_10s else f"~{target_s}-second"
+    return dict(clip_id=clip_row["clip_id"], src_file=src, day_label=day_label,
+                start_hms=start_hms, duration_desc=duration_desc)
+
+
+def make_user_message(video_path: Path, clip_row: pd.Series, is_10s: bool = False,
+                      guidance: str = "") -> dict:
+    """Annotation call message (G1 / G2). `guidance` (G2 regeneration feedback) is
+    appended as an extra paragraph when non-empty."""
+    task = USER_TASK_TMPL.format(**_meta_kwargs(clip_row, is_10s))
+    if guidance:
+        task += (f"\n\nA previous annotation attempt had these problems — avoid them "
+                 f"and follow these corrections:\n{guidance}")
+    return {"role": "user", "content": [_video_content(video_path), {"type": "text", "text": task}]}
+
+
+def make_baseline_message(video_path: Path, clip_row: pd.Series, is_10s: bool = False) -> dict:
+    """C1a watch-only baseline message: video + metadata, NO candidates (anti-anchoring)."""
+    task = CRITIC_BASELINE_USER_TASK_TMPL.format(**_meta_kwargs(clip_row, is_10s))
+    return {"role": "user", "content": [_video_content(video_path), {"type": "text", "text": task}]}
+
+
+def make_critic_message(video_path: Path, clip_row: pd.Series, baseline: dict,
+                        candidates: list, is_10s: bool = False) -> dict:
+    """C1b evaluation message: video + baseline + all candidate annotations."""
+    cand_block = "\n\n".join(
+        f"<<<CANDIDATE {i}>>>\n{json.dumps(c, ensure_ascii=False)}\n<<<END CANDIDATE {i}>>>"
+        for i, c in enumerate(candidates))
+    task = CRITIC_USER_TASK_TMPL.format(
+        n_candidates=len(candidates), baseline=json.dumps(baseline, ensure_ascii=False),
+        candidates_block=cand_block, **_meta_kwargs(clip_row, is_10s))
+    return {"role": "user", "content": [_video_content(video_path), {"type": "text", "text": task}]}
 
 
 def extract_usage(resp) -> dict:
@@ -786,8 +1080,139 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         psychology=layered["psychology"], causal_links=layered["causal_links"],
         clip_kind=clip_row.get("clip_kind", "30s"), recovery="ok",
     )
-    use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), recovery, usage)
+    use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), outcome, usage)
     return cap_rec, use_rec
+
+
+# ===========================================================================
+# Critic / baseline parsing (best-of-N)
+# ===========================================================================
+
+def _loads_json(content: str) -> dict:
+    """Fence-strip + json.loads + top-level dict check. Raises ParseFailed."""
+    text = content.strip()
+    if not text:
+        raise ParseFailed("empty content", content)
+    m = _JSON_FENCE_RE.match(text)
+    if m:
+        text = m.group(1).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ParseFailed(f"json decode: {e.msg}", content)
+    if not isinstance(data, dict):
+        raise ParseFailed(f"top-level not object (got {type(data).__name__})", content)
+    return data
+
+
+def _to_int(v, default=0) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_bool(v, default=False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return default
+
+
+def parse_baseline_json(content: str) -> dict:
+    """C1a output: {"verification_baseline": {scene, near_field, key_events, audio_gist, screens}}.
+    Tolerates the model returning the inner object directly (no wrapper key)."""
+    data = _loads_json(content)
+    bl = data.get("verification_baseline")
+    if not isinstance(bl, dict):
+        if any(k in data for k in ("scene", "key_events", "near_field", "audio_gist", "screens")):
+            bl = data
+        else:
+            raise ParseFailed("missing verification_baseline object", content)
+
+    def _lst(v) -> list:
+        return [str(x) for x in v] if isinstance(v, list) else []
+
+    return {"verification_baseline": {
+        "scene": str(bl.get("scene", "") or ""),
+        "near_field": _lst(bl.get("near_field")),
+        "key_events": _lst(bl.get("key_events")),
+        "audio_gist": _lst(bl.get("audio_gist")),
+        "screens": _lst(bl.get("screens")),
+    }}
+
+
+def parse_critic_json(content: str) -> dict:
+    """C1b/C2b output: {baseline_corrections, candidates[{index, scores, weighted_total,
+    issues, summary}], best_index, needs_regeneration, regeneration_guidance}."""
+    data = _loads_json(content)
+    raw_cands = data.get("candidates")
+    if not isinstance(raw_cands, list) or not raw_cands:
+        raise ParseFailed("critic: candidates missing/empty", content)
+    norm_cands = []
+    for c in raw_cands:
+        if not isinstance(c, dict):
+            continue
+        scores = c.get("scores") if isinstance(c.get("scores"), dict) else {}
+        norm_cands.append({
+            "index": _to_int(c.get("index")),
+            "scores": {k: _to_int(scores.get(k)) for k in
+                       ("faithfulness", "coverage", "timestamp_accuracy",
+                        "rule_compliance", "causal_quality")},
+            "weighted_total": _to_float(c.get("weighted_total")),
+            "issues": c.get("issues") if isinstance(c.get("issues"), list) else [],
+            "summary": str(c.get("summary", "") or ""),
+        })
+    if not norm_cands:
+        raise ParseFailed("critic: no valid candidates", content)
+    best = _to_int(data.get("best_index"), -1)
+    if not (0 <= best < len(norm_cands)):
+        # Tolerate a missing/out-of-range best_index: default to argmax weighted_total.
+        best = max(range(len(norm_cands)), key=lambda i: norm_cands[i]["weighted_total"])
+    corrections = data.get("baseline_corrections")
+    return {
+        "baseline_corrections": [str(x) for x in corrections] if isinstance(corrections, list) else [],
+        "candidates": norm_cands,
+        "best_index": best,
+        "needs_regeneration": _to_bool(data.get("needs_regeneration")),
+        "regeneration_guidance": str(data.get("regeneration_guidance", "") or ""),
+    }
+
+
+def _record_layers(cap: CaptionRecord) -> dict:
+    """Canonical annotation dict from a CaptionRecord (critic input shape)."""
+    return {"environment": cap.environment, "people": cap.people,
+            "self_actions": cap.self_actions, "other_actions": cap.other_actions,
+            "env_changes": cap.env_changes, "speech": cap.speech, "sound": cap.sound,
+            "interface": cap.interface, "psychology": cap.psychology,
+            "causal_links": cap.causal_links}
+
+
+def _cap_from_layers(layers: dict, clip_row: pd.Series, model: str, narrative: str,
+                     ts_captioned: str, tokens: dict, recovery: str = "ok") -> CaptionRecord:
+    """Rebuild a CaptionRecord from a parsed annotation dict (sidecar / adopted candidates
+    that have no live CaptionRecord)."""
+    return CaptionRecord(
+        clip_id=clip_row["clip_id"], global_idx=int(clip_row["global_idx"]),
+        day=int(clip_row["day"]), user=clip_row["user"], duration_s=float(clip_row["duration"]),
+        narrative=narrative, model=model, ts_captioned=ts_captioned,
+        slice_path=clip_row["slice_path"], tokens=tokens,
+        self_actions=layers["self_actions"], other_actions=layers["other_actions"],
+        people=layers["people"], environment=layers["environment"],
+        env_changes=layers["env_changes"], speech=layers["speech"], sound=layers["sound"],
+        interface=layers["interface"], psychology=layers["psychology"],
+        causal_links=layers["causal_links"], clip_kind=clip_row.get("clip_kind", "30s"),
+        recovery=recovery)
 
 
 # ===========================================================================
@@ -1016,13 +1441,16 @@ class ApiJob:
 
 
 class ApiResult:
-    __slots__ = ("global_idx", "clip_id", "caption_records", "usage_records", "failures")
+    __slots__ = ("global_idx", "clip_id", "caption_records", "usage_records",
+                 "candidate_records", "failures")
 
-    def __init__(self, *, global_idx=0, clip_id="", caption_records=None, usage_records=None, failures=None):
+    def __init__(self, *, global_idx=0, clip_id="", caption_records=None, usage_records=None,
+                 candidate_records=None, failures=None):
         self.global_idx = global_idx
         self.clip_id = clip_id
         self.caption_records = caption_records or []
         self.usage_records = usage_records or []
+        self.candidate_records = candidate_records or []
         self.failures = failures or []
 
 
@@ -1050,9 +1478,10 @@ def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg):
     raise last_exc
 
 
-def _process_one_clip_limited(client, model, video_path, clip_row, is_10s, log, limiter, cfg):
+def _process_one_clip_limited(client, model, video_path, clip_row, is_10s, log, limiter, cfg,
+                              guidance: str = ""):
     messages = [{"role": "system", "content": SYSTEM_MSG},
-                make_user_message(video_path, clip_row, is_10s=is_10s)]
+                make_user_message(video_path, clip_row, is_10s=is_10s, guidance=guidance)]
     resp, latency, attempt = _call_api_limited(client, model, messages, log, clip_row["clip_id"], limiter, cfg)
     usage = extract_usage(resp)
     content = resp.choices[0].message.content or ""
@@ -1060,7 +1489,408 @@ def _process_one_clip_limited(client, model, video_path, clip_row, is_10s, log, 
     return cap_rec, use_rec, content
 
 
-def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, worker_id):
+def _sample_annotation_call(client, model, video_path, row, is_10s, log, limiter, cfg,
+                            guidance: str = "", stage: str = "generate", call_index: int = -1):
+    """One annotation call (G1 generate / G2 refine) incl. the Mimo first-rejection retry.
+    Returns (cap_rec|None, [UsageRecord], content)."""
+    clip_id = row["clip_id"]
+    usage_records = []
+    cap, use, content = _process_one_clip_limited(client, model, video_path, row, is_10s,
+                                                  log, limiter, cfg, guidance=guidance)
+    if cap is None:
+        reason = use.recovery
+        # Mimo often rejects the very first video request; the second request hits the
+        # cheap prefix cache and almost always succeeds. Treat this as normal, not a crisis.
+        use.recovery = "first_attempt_rejection"
+        usage_records.append(use)
+        log.info(f"[{clip_id}] call returned '{reason}'; retrying once "
+                 f"(normal for Mimo, retry is cheap via prefix cache)")
+        try:
+            cap, use2, content = _process_one_clip_limited(client, model, video_path, row,
+                                                           is_10s, log, limiter, cfg, guidance=guidance)
+            usage_records.append(use2)
+        except Exception as e:
+            log.warning(f"[{clip_id}] retry crashed: {type(e).__name__}: {e}")
+            cap = None
+    else:
+        usage_records.append(use)
+    for u in usage_records:
+        u.stage = stage
+        u.call_index = call_index
+    return cap, usage_records, content
+
+
+def _call_baseline(client, model, video_path, row, is_10s, log, limiter, cfg):
+    """C1a: watch-only verification-baseline extraction. Retries once on parse failure.
+    Returns (baseline|None, [UsageRecord])."""
+    clip_id = row["clip_id"]
+    gid = int(row["global_idx"])
+    messages = [{"role": "system", "content": CRITIC_BASELINE_SYSTEM_MSG},
+                make_baseline_message(video_path, row, is_10s=is_10s)]
+    last_use = None
+    for attempt in range(2):
+        try:
+            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter, cfg)
+        except Exception as e:
+            log.warning(f"[{clip_id}] baseline API call failed: {type(e).__name__}: {e}")
+            if attempt == 0:
+                time.sleep(2.0)
+                continue
+            return None, [last_use] if last_use else []
+        usage = extract_usage(resp)
+        content = resp.choices[0].message.content or ""
+        use = UsageRecord(clip_id, gid, at, round(latency, 3), "ok", usage,
+                          stage="baseline", call_index=-1)
+        last_use = use
+        try:
+            return parse_baseline_json(content), [use]
+        except ParseFailed as e:
+            use.recovery = OUTCOME_PARSE_FAILED
+            use.raw_content = content
+            log.warning(f"[{clip_id}] baseline parse failed ({e.reason}); retrying once")
+    return None, [last_use]
+
+
+def _call_critic(client, model, video_path, row, is_10s, log, limiter, cfg, baseline, candidates):
+    """C1b/C2b: critic evaluation. Retries once on parse failure.
+    Returns (critic_json|None, [UsageRecord])."""
+    clip_id = row["clip_id"]
+    gid = int(row["global_idx"])
+    messages = [{"role": "system", "content": CRITIC_SYSTEM_MSG},
+                make_critic_message(video_path, row, baseline, candidates, is_10s=is_10s)]
+    last_use = None
+    for attempt in range(2):
+        try:
+            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter, cfg)
+        except Exception as e:
+            log.warning(f"[{clip_id}] critic API call failed: {type(e).__name__}: {e}")
+            if attempt == 0:
+                time.sleep(2.0)
+                continue
+            return None, [last_use] if last_use else []
+        usage = extract_usage(resp)
+        content = resp.choices[0].message.content or ""
+        use = UsageRecord(clip_id, gid, at, round(latency, 3), "ok", usage,
+                          stage="critic", call_index=-1)
+        last_use = use
+        try:
+            return parse_critic_json(content), [use]
+        except ParseFailed as e:
+            use.recovery = OUTCOME_PARSE_FAILED
+            use.raw_content = content
+            log.warning(f"[{clip_id}] critic parse failed ({e.reason}); retrying once")
+    return None, [last_use]
+
+
+def _handle_zero_valid(client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
+                       reason, content_preview, thinking):
+    """All annotation attempts for a clip produced no valid candidate. Legacy behavior:
+    give up for sub-30 clips, 10s-slice fallback for 30s/segment_open clips. Fallback
+    slices are captioned with a SINGLE call each (no best-of-N / critic)."""
+    clip_id = row["clip_id"]
+    gid = int(row["global_idx"])
+    caption_records, usage_records, failures = [], [], []
+    clip_kind = row.get("clip_kind", "30s")
+    if clip_kind not in ("30s", "segment_open"):
+        log.warning(f"[{clip_id}] all attempts failed ({reason}); giving up "
+                    f"({clip_kind} clip, no further slicing)")
+        failures.append({"clip_id": clip_id, "global_idx": gid, "error": "all_attempts_failed",
+                         "reason": reason, "raw_content_preview": (content_preview or "")[:200]})
+        return caption_records, usage_records, failures
+    log.warning(f"[{clip_id}] all attempts failed ({reason}); falling back to ~10s slices")
+    try:
+        slice_paths = slice_to_10s(slice_path, clip_id, tmp_10s_dir)
+    except Exception as e:
+        log.error(f"[{clip_id}] 10s slicing failed: {e}")
+        failures.append({"clip_id": clip_id, "global_idx": gid, "error": f"slice_failed: {e}",
+                         "reason": reason, "raw_content_preview": (content_preview or "")[:200]})
+        return caption_records, usage_records, failures
+    log.info(f"[{clip_id}] sliced into {len(slice_paths)} pieces; captioning each ~10s clip (single call)")
+    ten_s_ok = 0
+    for sp in slice_paths:
+        sub_row = row.copy()
+        sub_row["clip_id"] = f"{clip_id}_10s_{ten_s_ok + 1}"
+        sub_row["duration"] = 10.0
+        try:
+            sub_cap, sub_use, _ = _process_one_clip_limited(
+                client, model, sp, sub_row, True, log, limiter, cfg)
+        except Exception as e:
+            log.warning(f"[{clip_id}] 10s slice {sp.name} failed: {type(e).__name__}: {e}")
+            continue
+        if sub_cap is not None:
+            sub_cap.recovery = "10s_slices"
+            sub_cap.best_of_n = 1
+            sub_cap.thinking = thinking
+            caption_records.append(sub_cap)
+            usage_records.append(sub_use)
+            ten_s_ok += 1
+            log.info(f"[{clip_id}] 10s slice {sp.name} succeeded")
+        else:
+            log.warning(f"[{clip_id}] 10s slice {sp.name} rejected/parse-failed")
+    log.info(f"[{clip_id}] 10s fallback result: {ten_s_ok}/{len(slice_paths)} slices succeeded")
+    if ten_s_ok == 0:
+        failures.append({"clip_id": clip_id, "global_idx": gid, "error": "all_attempts_failed",
+                         "reason": reason, "raw_content_preview": (content_preview or "")[:200]})
+    return caption_records, usage_records, failures
+
+
+def _finalize_candidate(cap, layers, meta, row, model, clip_kind):
+    """Turn a candidate (live cap_rec, or sidecar/adopted layers+meta) into a CaptionRecord."""
+    if cap is not None:
+        cap.clip_kind = clip_kind
+        return cap
+    narrative = meta.get("narrative") or json.dumps(layers, ensure_ascii=False)
+    return _cap_from_layers(
+        layers, row, meta.get("model") or model, narrative,
+        meta.get("ts_captioned") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        meta.get("tokens") or {"in": 0, "out": 0, "cached": 0},
+        recovery=meta.get("recovery", "ok"))
+
+
+def _pick_candidate(valid, i, row, model, clip_kind):
+    """valid: sorted list of (call_index, (cap, layers, meta)); return finalized cap at i."""
+    cap, layers, meta = valid[i][1]
+    return _finalize_candidate(cap, layers, meta, row, model, clip_kind)
+
+
+def _process_clip_legacy(client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir, thinking):
+    """The ORIGINAL single-call per-clip flow (best_of_n=1), behaviourally identical:
+    first-rejection retry, then give-up / 10s-slice fallback. Records are tagged
+    best_of_n=1 so mode-aware resume treats them as single-call output."""
+    clip_id = row["clip_id"]
+    gid = int(row["global_idx"])
+    caption_records, usage_records, failures = [], [], []
+    try:
+        cap_rec, use_rec, content = _process_one_clip_limited(
+            client, model, slice_path, row, False, log, limiter, cfg)
+        use_rec2 = None
+        if cap_rec is None:
+            reason = use_rec.recovery
+            use_rec.recovery = "first_attempt_rejection"
+            usage_records.append(use_rec)
+            log.info(f"[{clip_id}] first attempt returned '{reason}'; retrying once "
+                     f"(normal for Mimo, retry is cheap via prefix cache)")
+            try:
+                cap_rec, use_rec2, content = _process_one_clip_limited(
+                    client, model, slice_path, row, False, log, limiter, cfg)
+            except Exception as e:
+                log.warning(f"[{clip_id}] retry crashed: {type(e).__name__}: {e}")
+                cap_rec = None
+                use_rec2 = None
+
+        if cap_rec is None:
+            reason2 = use_rec2.recovery if use_rec2 is not None else "retry_failed"
+            if use_rec2 is not None:
+                usage_records.append(use_rec2)
+            caps, uses, fails = _handle_zero_valid(
+                client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
+                reason2, content, thinking)
+            caption_records.extend(caps)
+            usage_records.extend(uses)
+            failures.extend(fails)
+        else:
+            caption_records.append(cap_rec)
+            if use_rec2 is not None:
+                usage_records.append(use_rec2)
+            elif not usage_records:
+                usage_records.append(use_rec)
+        for c in caption_records:
+            c.best_of_n = 1
+            c.thinking = thinking
+    except Exception as e:
+        log.error(f"[{clip_id}] worker crash: {type(e).__name__}: {e}")
+        failures.append({"clip_id": clip_id, "global_idx": gid,
+                         "error": f"worker_crash: {type(e).__name__}: {e}"})
+    return caption_records, usage_records, failures
+
+
+def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
+                            n_samples, refine_samples, existing_slots, adopted_record, thinking):
+    """Best-of-N + two-phase critic workflow for ONE clip:
+
+      G1   fill call indices 0..N-1: reuse sidecar candidates and the adopted main
+           record, generate only the missing indices (each call tagged with call_index)
+      C1a  watch-only baseline extraction (video only, no candidates)
+      C1b  critic evaluation (video + baseline + all candidates) -> best_index
+      G2   if the best still fails: refine_samples guided regenerations
+      C2b  second critic on {C1b best} ∪ {G2 samples}, reusing the C1a baseline
+
+    n_valid==0 -> legacy give-up / 10s-slices fallback; n_valid==1 -> keep it, no critic.
+    Returns (caption_records, usage_records, candidate_records, failures)."""
+    clip_id = row["clip_id"]
+    gid = int(row["global_idx"])
+    clip_kind = row.get("clip_kind", "30s")
+    caption_records, usage_records, candidate_records, failures = [], [], [], []
+
+    # --- Assemble the candidate pool: adopted main record + sidecar candidates + fresh G1 ---
+    slots = {}   # call_index -> (cap|None, layers, meta)
+    if adopted_record is not None:
+        try:
+            layers = parse_json_caption(adopted_record["narrative"])
+            slots[0] = (None, layers, {"tokens": adopted_record.get("tokens") or {},
+                                       "ts_captioned": adopted_record.get("ts_captioned", ""),
+                                       "model": adopted_record.get("model", model),
+                                       "narrative": adopted_record.get("narrative", ""),
+                                       "recovery": "adopted"})
+            log.info(f"[{clip_id}] adopting existing single-call record as candidate 0")
+        except Exception as e:
+            log.warning(f"[{clip_id}] existing record unparseable; not adopting: {e}")
+    for idx, cand in existing_slots.items():
+        if idx >= n_samples:
+            # Stale slot from a run with a larger N; never part of the current pool.
+            continue
+        try:
+            layers = parse_json_caption(cand.narrative)
+            slots[idx] = (None, layers, {"tokens": cand.tokens, "ts_captioned": cand.ts_captioned,
+                                         "model": cand.model, "narrative": cand.narrative,
+                                         "recovery": "ok"})
+        except Exception as e:
+            log.warning(f"[{clip_id}] sidecar candidate {idx} unparseable; regenerating: {e}")
+    last_fail_content = ""
+    for idx in range(n_samples):
+        if idx in slots:
+            continue
+        cap, uses, content = _sample_annotation_call(
+            client, model, slice_path, row, False, log, limiter, cfg,
+            stage="generate", call_index=idx)
+        usage_records.extend(uses)
+        if cap is not None:
+            slots[idx] = (cap, _record_layers(cap), {"tokens": cap.tokens,
+                                                     "ts_captioned": cap.ts_captioned,
+                                                     "model": cap.model,
+                                                     "narrative": cap.narrative,
+                                                     "recovery": "ok"})
+            candidate_records.append(CandidateRecord(
+                clip_id, gid, idx, "generate", cap.narrative, cap.model,
+                cap.ts_captioned, cap.tokens, recovery="ok"))
+        else:
+            last_fail_content = content
+            log.warning(f"[{clip_id}] sample {idx} produced no valid annotation "
+                        f"({uses[-1].recovery if uses else '?'})")
+    valid = sorted(slots.items())   # [(call_index, (cap, layers, meta))...]
+    n_valid = len(valid)
+
+    if n_valid == 0:
+        caps, uses, fails = _handle_zero_valid(
+            client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
+            "all_samples_failed", last_fail_content, thinking)
+        caption_records.extend(caps)
+        usage_records.extend(uses)
+        failures.extend(fails)
+        return caption_records, usage_records, candidate_records, failures
+
+    if n_valid == 1:
+        chosen = _pick_candidate(valid, 0, row, model, clip_kind)
+        chosen.best_of_n = n_samples
+        chosen.thinking = thinking
+        chosen.critic = {"enabled": True, "skipped": "single_valid"}
+        caption_records.append(chosen)
+        log.info(f"[{clip_id}] only {n_valid} valid candidate; keeping it without critic")
+        return caption_records, usage_records, candidate_records, failures
+
+    # --- Two-phase critic: C1a baseline, then C1b evaluation ---
+    cand_layers = [layers for _, (_, layers, _) in valid]
+    baseline, use_b = _call_baseline(client, model, slice_path, row, False, log, limiter, cfg)
+    usage_records.extend(use_b)
+    if baseline is None:
+        chosen = _pick_candidate(valid, 0, row, model, clip_kind)
+        chosen.best_of_n = n_samples
+        chosen.thinking = thinking
+        chosen.critic = {"enabled": True, "failed": "baseline_failed"}
+        caption_records.append(chosen)
+        log.warning(f"[{clip_id}] C1a baseline failed; keeping candidate {valid[0][0]} without critic")
+        return caption_records, usage_records, candidate_records, failures
+
+    crit, use_c = _call_critic(client, model, slice_path, row, False, log, limiter, cfg,
+                               baseline, cand_layers)
+    usage_records.extend(use_c)
+    if crit is None:
+        chosen = _pick_candidate(valid, 0, row, model, clip_kind)
+        chosen.best_of_n = n_samples
+        chosen.thinking = thinking
+        chosen.critic = {"enabled": True, "failed": "critic_failed"}
+        caption_records.append(chosen)
+        log.warning(f"[{clip_id}] C1b critic failed; keeping first valid candidate without critic")
+        return caption_records, usage_records, candidate_records, failures
+
+    best_pos = min(max(crit["best_index"], 0), n_valid - 1)
+    chosen = _pick_candidate(valid, best_pos, row, model, clip_kind)
+    chosen_layers = valid[best_pos][1][1]
+    evaluation = crit
+    refined = False
+    final_src = f"candidate {valid[best_pos][0]}"
+    baseline_usage_tokens = use_b[0].usage if use_b else {}
+    critic_usage_tokens = use_c[0].usage if use_c else {}
+
+    # --- G2 + C2b: guided regeneration when even the best fails the threshold ---
+    if crit["needs_regeneration"] and refine_samples > 0:
+        guidance = (crit.get("regeneration_guidance") or "").strip()
+        if guidance:
+            log.info(f"[{clip_id}] best candidate needs regeneration; "
+                     f"sampling {refine_samples} guided refinements")
+            new_slots = []
+            for j in range(refine_samples):
+                cap, uses, _ = _sample_annotation_call(
+                    client, model, slice_path, row, False, log, limiter, cfg,
+                    guidance=guidance, stage="refine", call_index=j)
+                usage_records.extend(uses)
+                if cap is not None:
+                    new_slots.append((cap, _record_layers(cap)))
+                    candidate_records.append(CandidateRecord(
+                        clip_id, gid, j, "refine", cap.narrative, cap.model,
+                        cap.ts_captioned, cap.tokens, recovery="ok"))
+            if new_slots:
+                pool = [chosen_layers] + [layers for _, layers in new_slots]
+                crit2, use_c2 = _call_critic(client, model, slice_path, row, False, log,
+                                             limiter, cfg, baseline, pool)
+                usage_records.extend(use_c2)
+                if crit2 is not None:
+                    best2 = min(max(crit2["best_index"], 0), len(pool) - 1)
+                    if best2 > 0:
+                        cap2, layers2 = new_slots[best2 - 1]
+                        chosen = _finalize_candidate(
+                            cap2, layers2,
+                            {"tokens": cap2.tokens, "ts_captioned": cap2.ts_captioned,
+                             "model": cap2.model, "narrative": cap2.narrative, "recovery": "ok"},
+                            row, model, clip_kind)
+                        final_src = f"refine candidate {best2 - 1}"
+                    evaluation = crit2
+                    refined = True
+                    critic_usage_tokens = use_c2[0].usage if use_c2 else critic_usage_tokens
+                    log.info(f"[{clip_id}] C2b refined best -> candidate {best2}/{len(pool) - 1}")
+                else:
+                    log.warning(f"[{clip_id}] C2b critic failed; keeping C1b best")
+            else:
+                log.warning(f"[{clip_id}] no valid refine candidates; keeping C1b best")
+
+    chosen.best_of_n = n_samples
+    chosen.thinking = thinking
+    chosen.critic = {
+        "enabled": True,
+        "baseline": {"verification_baseline": baseline["verification_baseline"],
+                     "tokens": baseline_usage_tokens},
+        "candidates": [{"call_index": idx, "weighted_total": c["weighted_total"]}
+                       for (idx, _), c in zip(valid, crit["candidates"])],
+        "evaluation": {"baseline_corrections": evaluation.get("baseline_corrections", []),
+                       "best_index": evaluation.get("best_index", 0),
+                       "needs_regeneration": evaluation.get("needs_regeneration", False),
+                       "regeneration_guidance": evaluation.get("regeneration_guidance", ""),
+                       "tokens": critic_usage_tokens},
+        "refined": refined,
+    }
+    caption_records.append(chosen)
+    log.info(f"[{clip_id}] best-of-{n_valid} critic chose {final_src} (refined={refined})")
+    return caption_records, usage_records, candidate_records, failures
+
+
+def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, worker_id,
+                best_of_n=1, refine_samples=2, candidate_slots=None, clip_records=None):
+    """API worker. best_of_n=1 keeps the legacy single-call flow; best_of_n>=2 runs the
+    best-of-N sampling + two-phase critic workflow per clip. candidate_slots / clip_records
+    (shared, read-only) enable resuming: existing candidates are reused and legacy
+    single-call records are adopted as candidate 0."""
+    candidate_slots = candidate_slots or {}
+    clip_records = clip_records or {}
     while True:
         job = in_q.get()
         if job is None:
@@ -1068,7 +1898,7 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
             return
         row, slice_path = job.row, job.slice_path
         clip_id, gid = row["clip_id"], int(row["global_idx"])
-        caption_records, usage_records, failures = [], [], []
+        caption_records, usage_records, candidate_records, failures = [], [], [], []
 
         if not slice_path.exists():
             log.error(f"[{clip_id}] slice not found: {slice_path}")
@@ -1079,89 +1909,27 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
             continue
 
         try:
-            cap_rec, use_rec, content = _process_one_clip_limited(
-                client, model, slice_path, row, False, log, limiter, cfg)
-            use_rec2 = None
-            if cap_rec is None:
-                reason = use_rec.recovery
-                # Mimo often rejects the very first video request; the second
-                # request hits the cheap prefix cache and almost always succeeds.
-                # Treat this as normal, not a crisis.
-                use_rec.recovery = "first_attempt_rejection"
-                usage_records.append(use_rec)
-                log.info(f"[{clip_id}] first attempt returned '{reason}'; retrying once "
-                         f"(normal for Mimo, retry is cheap via prefix cache)")
-                try:
-                    cap_rec, use_rec2, content2 = _process_one_clip_limited(
-                        client, model, slice_path, row, False, log, limiter, cfg)
-                except Exception as e:
-                    log.warning(f"[{clip_id}] retry crashed: {type(e).__name__}: {e}")
-                    cap_rec = None
-                    use_rec2 = None
-
-            if cap_rec is None:
-                reason2 = use_rec2.recovery if use_rec2 is not None else "retry_failed"
-                if use_rec2 is not None:
-                    usage_records.append(use_rec2)
-                # Sub-30 clips (first-class 10s/15s/5s/6s pieces) cannot be sliced
-                # further, so give up after the single retry. Only legacy 30s /
-                # segment_open clips (from --clip-duration 30) fall back to 10s slicing.
-                clip_kind = row.get("clip_kind", "30s")
-                if clip_kind not in ("30s", "segment_open"):
-                    log.warning(f"[{clip_id}] second attempt also failed ({reason2}); "
-                                f"giving up ({clip_kind} clip, no further slicing)")
-                    failures.append({"clip_id": clip_id, "global_idx": gid,
-                                     "error": "all_attempts_failed", "reason": reason2,
-                                     "raw_content_preview": (content or "")[:200]})
-                else:
-                    log.warning(f"[{clip_id}] second attempt also failed ({reason2}); "
-                                f"falling back to ~10s slices")
-                    try:
-                        slice_paths = slice_to_10s(slice_path, clip_id, tmp_10s_dir)
-                    except Exception as e:
-                        log.error(f"[{clip_id}] 10s slicing failed: {e}")
-                        failures.append({"clip_id": clip_id, "global_idx": gid, "error": f"slice_failed: {e}",
-                                         "reason": reason2, "raw_content_preview": (content or "")[:200]})
-                        out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
-                                            usage_records=usage_records, failures=failures))
-                        in_q.task_done()
-                        continue
-                    log.info(f"[{clip_id}] sliced into {len(slice_paths)} pieces; captioning each ~10s clip")
-                    ten_s_ok = 0
-                    for sp in slice_paths:
-                        sub_row = row.copy()
-                        sub_row["clip_id"] = f"{clip_id}_10s_{ten_s_ok + 1}"
-                        sub_row["duration"] = 10.0
-                        try:
-                            sub_cap, sub_use, _ = _process_one_clip_limited(
-                                client, model, sp, sub_row, True, log, limiter, cfg)
-                        except Exception as e:
-                            log.warning(f"[{clip_id}] 10s slice {sp.name} failed: {type(e).__name__}: {e}")
-                            continue
-                        if sub_cap is not None:
-                            sub_cap.recovery = "10s_slices"
-                            caption_records.append(sub_cap)
-                            usage_records.append(sub_use)
-                            ten_s_ok += 1
-                            log.info(f"[{clip_id}] 10s slice {sp.name} succeeded")
-                        else:
-                            log.warning(f"[{clip_id}] 10s slice {sp.name} rejected/parse-failed")
-                    log.info(f"[{clip_id}] 10s fallback result: {ten_s_ok}/{len(slice_paths)} slices succeeded")
-                    if ten_s_ok == 0:
-                        failures.append({"clip_id": clip_id, "global_idx": gid, "error": "all_attempts_failed",
-                                         "reason": reason2, "raw_content_preview": (content or "")[:200]})
+            if best_of_n <= 1:
+                caption_records, usage_records, failures = _process_clip_legacy(
+                    client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir, cfg.thinking)
             else:
-                caption_records.append(cap_rec)
-                if use_rec2 is not None:
-                    usage_records.append(use_rec2)
-                elif not usage_records:
-                    usage_records.append(use_rec)
+                existing = candidate_slots.get(clip_id, {})
+                adopted = clip_records.get(clip_id)
+                # Adopt the existing main record only when it does NOT match the current
+                # run config (a matching record means the clip is complete and was skipped
+                # upstream; this is a safety net for that invariant).
+                if adopted is not None and _record_matches_mode(adopted, best_of_n, cfg.thinking):
+                    adopted = None
+                caption_records, usage_records, candidate_records, failures = _process_clip_best_of_n(
+                    client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
+                    best_of_n, refine_samples, existing, adopted, cfg.thinking)
         except Exception as e:
             log.error(f"[{clip_id}] worker crash: {type(e).__name__}: {e}")
             failures.append({"clip_id": clip_id, "global_idx": gid,
                              "error": f"worker_crash: {type(e).__name__}: {e}"})
         out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
-                            usage_records=usage_records, failures=failures))
+                            usage_records=usage_records, candidate_records=candidate_records,
+                            failures=failures))
         in_q.task_done()
 
 
@@ -1173,9 +1941,10 @@ class OrderedWriter:
     """Flush results to jsonl in strict global_idx order. API workers finish out
     of order, so we buffer future results in a heap and emit when next_idx arrives."""
 
-    def __init__(self, captions_path, usage_path, log, next_idx=1):
+    def __init__(self, captions_path, usage_path, candidates_path, log, next_idx=1):
         self.captions_path = captions_path
         self.usage_path = usage_path
+        self.candidates_path = candidates_path
         self.log = log
         self.next_idx = next_idx
         self._heap = []
@@ -1184,6 +1953,8 @@ class OrderedWriter:
         self.n_written = 0
         self.cap_f = captions_path.open("a", encoding="utf-8")
         self.use_f = usage_path.open("a", encoding="utf-8")
+        self.cand_f = (candidates_path.open("a", encoding="utf-8")
+                       if candidates_path is not None else None)
 
     def submit(self, result):
         with self._lock:
@@ -1198,6 +1969,9 @@ class OrderedWriter:
                 self.cap_f.write(json.dumps(asdict(cap), ensure_ascii=False) + "\n")
             for use in res.usage_records:
                 self.use_f.write(json.dumps(asdict(use), ensure_ascii=False) + "\n")
+            if self.cand_f is not None:
+                for cand in res.candidate_records:
+                    self.cand_f.write(json.dumps(asdict(cand), ensure_ascii=False) + "\n")
             self.n_written += 1
             if res.global_idx >= self.next_idx:
                 self.next_idx = res.global_idx + 1
@@ -1217,6 +1991,8 @@ class OrderedWriter:
                 self.log.warning(f"[writer] {len(self._heap)} results never flushed (missing global_idx)")
             self.cap_f.close()
             self.use_f.close()
+            if self.cand_f is not None:
+                self.cand_f.close()
 
 
 # ===========================================================================
@@ -1281,6 +2057,71 @@ def max_written_global_idx(captions_path):
     return top
 
 
+def load_existing_clip_records(captions_path) -> dict:
+    """{clip_id: last record dict} — used for mode-aware resume and for adopting
+    legacy single-call records into best-of-N candidate pools."""
+    recs = {}
+    for rec in _iter_caption_records(captions_path):
+        recs[rec["clip_id"]] = rec
+    return recs
+
+
+def load_existing_candidate_slots(candidates_path) -> dict:
+    """{(clip_id, call_index): CandidateRecord} from the *_candidates.jsonl sidecar.
+    Only stage=="generate" slots are reusable (refine slots are trace-only and never
+    re-fed into the critic pool)."""
+    slots = {}
+    if not candidates_path or not candidates_path.exists():
+        return slots
+    for line in candidates_path.open(encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("stage") != "generate":
+            continue
+        try:
+            cand = CandidateRecord(
+                clip_id=d["clip_id"], global_idx=int(d.get("global_idx", 0)),
+                call_index=int(d["call_index"]), stage=d.get("stage", "generate"),
+                narrative=d.get("narrative", ""), model=d.get("model", ""),
+                ts_captioned=d.get("ts_captioned", ""), tokens=d.get("tokens") or {},
+                recovery=d.get("recovery", ""))
+        except (KeyError, TypeError, ValueError):
+            continue
+        slots[(cand.clip_id, cand.call_index)] = cand
+    # Group by clip_id for worker lookup.
+    by_clip = {}
+    for (cid, idx), cand in slots.items():
+        by_clip.setdefault(cid, {})[idx] = cand
+    return by_clip
+
+
+def _record_matches_mode(rec: dict, best_of_n: int, thinking: str) -> bool:
+    """True when an existing final record satisfies the current run config, i.e. the
+    clip does NOT need reprocessing. best_of_n=1 accepts any record (legacy)."""
+    if best_of_n <= 1:
+        return True
+    return (rec.get("best_of_n") == best_of_n and rec.get("thinking") == thinking
+            and "critic" in rec)
+
+
+def _clip_done(clip_id: str, gid: int, clip_records: dict, best_of_n: int,
+               thinking: str, resume_idx: int) -> bool:
+    """Resume completion check: skip clips whose LAST final record matches the current
+    run config (best_of_n + thinking + critic marker). Clips with no matching record —
+    including ones that failed or were finalized under a different config in a previous
+    run — are (re)processed. NOTE: no `gid <= resume_idx` shortcut here on purpose:
+    a record from an older config must NOT be treated as done under the new mode."""
+    rec = clip_records.get(clip_id)
+    if rec is None:
+        return False
+    return _record_matches_mode(rec, best_of_n, thinking)
+
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -1340,6 +2181,17 @@ def main():
     ap.add_argument("--reset-yes-i-know", action="store_true",
                     help="confirm --reset when the output already has >10 records (prevents accidental data loss)")
     ap.add_argument("--limit", type=int, default=None, help="only process first N clips (debug)")
+    # --- Best-of-N sampling + two-phase critic ---
+    ap.add_argument("--best-of-n", type=int, default=1, metavar="N",
+                    help="sample each clip N times (default 1 = legacy single call, no critic). "
+                         "N>=2 runs best-of-N: G1 sampling -> two-phase critic "
+                         "(watch-only baseline extraction + evaluation) picks the best; "
+                         "if even the best fails the threshold, guided regeneration refines it. "
+                         "Existing candidates in the *_candidates.jsonl sidecar are reused "
+                         "on resume; only missing call indices are generated.")
+    ap.add_argument("--refine-samples", type=int, default=2, metavar="M",
+                    help="guided regeneration samples (G2) when the critic says the best "
+                         "candidate still needs work (default 2, plan-doc value).")
     args = ap.parse_args()
 
     # Thinking-mode requests run ~30s+; scale workers with the RPM cap but cap at
@@ -1378,6 +2230,9 @@ def main():
     usage_path = captions_dir / f"{stem}_usage.jsonl"
     summary_path = captions_dir / f"{stem}_summary.json"
     log_path = captions_dir / f"{stem}_run.log"
+    # best-of-N candidate sidecar: one line per (clip_id, call_index) sample, so resume
+    # reuses existing calls and only generates the missing indices.
+    candidates_path = captions_dir / f"{stem}_candidates.jsonl"
     cache_dir = captions_dir / "_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     slices_dir = cache_dir / "slices"
@@ -1400,7 +2255,7 @@ def main():
             print(f"ERROR: --reset would delete {out_file} which already has {existing} caption records.\n"
                   f"  If you really mean it, add --reset-yes-i-know.", file=sys.stderr)
             sys.exit(2)
-        for p in [out_file, usage_path, summary_path, log_path]:
+        for p in [out_file, usage_path, summary_path, log_path, candidates_path]:
             if p.exists():
                 p.unlink()
 
@@ -1424,7 +2279,8 @@ def main():
              f"time={args.start_time or '00:00'}-{args.end_time or '23:59'} "
              f"clip_duration={args.clip_duration}s src_root={src_root} "
              f"-> {src_root / args.participant / f'DAY{args.day}'}")
-    log.info(f"model={args.model} thinking={args.thinking} json_mode={json_mode}")
+    log.info(f"model={args.model} thinking={args.thinking} json_mode={json_mode} "
+             f"best_of_n={args.best_of_n} refine_samples={args.refine_samples}")
     log.info(f"output: {out_file}")
 
     # --- Decide clip rows / units ---
@@ -1459,10 +2315,19 @@ def main():
                  f"@ {args.resolution}x{args.resolution}/{args.fps}fps")
         clips_df = None
 
-    # --- Resume ---
+    # --- Resume (mode-aware) ---
+    # A clip is complete only when its LAST final record matches the current run config
+    # (best_of_n + thinking + critic marker). Existing best-of-N candidates in the sidecar
+    # are always reusable — resume only generates the missing call indices; legacy
+    # single-call records are adopted as candidate 0.
     resume_idx = max_written_global_idx(out_file) if args.skip_existing else 0
-    done_ids = load_existing_clip_ids(out_file) if args.skip_existing else set()
-    log.info(f"resume: skip_existing={args.skip_existing} already_done={len(done_ids)} max_gid={resume_idx}")
+    clip_records = load_existing_clip_records(out_file) if args.skip_existing else {}
+    candidate_slots = (load_existing_candidate_slots(candidates_path)
+                       if (args.skip_existing and args.best_of_n > 1) else {})
+    n_slots = sum(len(v) for v in candidate_slots.values())
+    log.info(f"resume: skip_existing={args.skip_existing} mode=(best_of_n={args.best_of_n}, "
+             f"thinking={args.thinking}) final_records={len(clip_records)} "
+             f"candidate_slots={n_slots} max_gid={resume_idx}")
 
     limiter = SlidingWindowRateLimiter(args.max_rpm)
     client = OpenAI(api_key=api_key, base_url=args.base_url)
@@ -1470,10 +2335,10 @@ def main():
     produced_q: queue.Queue = queue.Queue()
     api_in_q: queue.Queue = queue.Queue(maxsize=args.api_workers * 2)
     result_q: queue.Queue = queue.Queue()
-    writer = OrderedWriter(out_file, usage_path, log, next_idx=resume_idx + 1)
+    writer = OrderedWriter(out_file, usage_path, candidates_path, log, next_idx=resume_idx + 1)
 
     # --- Stats ---
-    all_usage, all_records, all_failures = [], [], []
+    all_usage, all_records, all_failures, all_candidates = [], [], [], []
     outcome_counts = {OUTCOME_OK: 0, OUTCOME_SAFETY: 0, OUTCOME_PARSE_FAILED: 0,
                       OUTCOME_EMPTY: 0, "10s_slices": 0,
                       "first_attempt_rejection": 0}
@@ -1490,7 +2355,8 @@ def main():
         fed = 0
         for _, row in rows.iterrows():
             clip_id = row["clip_id"]
-            if args.skip_existing and (clip_id in done_ids or int(row["global_idx"]) <= resume_idx):
+            if args.skip_existing and _clip_done(clip_id, int(row["global_idx"]), clip_records,
+                                                 args.best_of_n, args.thinking, resume_idx):
                 skipped_existing += 1
                 continue
             sp = row["slice_path"]
@@ -1540,7 +2406,11 @@ def main():
     for w in range(args.api_workers):
         t = threading.Thread(target=_api_worker,
                              args=(api_in_q, result_q, client, args.model, limiter, cfg,
-                                   tmp_10s_dir, log, w), name=f"api-{w}", daemon=True)
+                                   tmp_10s_dir, log, w), name=f"api-{w}", daemon=True,
+                             kwargs={"best_of_n": args.best_of_n,
+                                     "refine_samples": args.refine_samples,
+                                     "candidate_slots": candidate_slots,
+                                     "clip_records": clip_records})
         t.start()
         api_threads.append(t)
 
@@ -1563,7 +2433,8 @@ def main():
                 continue
             pp_results_for_parquet.append(pres.row)
             clip_id = pres.row["clip_id"]
-            if args.skip_existing and (clip_id in done_ids or int(pres.row["global_idx"]) <= resume_idx):
+            if args.skip_existing and _clip_done(clip_id, int(pres.row["global_idx"]), clip_records,
+                                                 args.best_of_n, args.thinking, resume_idx):
                 skipped_existing += 1
                 continue
             api_in_q.put(ApiJob(row=pres.row, slice_path=pres.slice_path))
@@ -1630,9 +2501,14 @@ def main():
             all_records.append(cap)
         for use in res.usage_records:
             all_usage.append(use)
-            outcome_counts[use.recovery if use.recovery in outcome_counts else OUTCOME_OK] += 1
-            if use.recovery == "":
-                outcome_counts[OUTCOME_OK] += 1
+            # Outcome buckets count ANNOTATION calls only (G1 generate + G2 refine);
+            # baseline/critic calls are tracked via stage counts below.
+            if use.stage in ("generate", "refine"):
+                outcome_counts[use.recovery if use.recovery in outcome_counts else OUTCOME_OK] += 1
+                if use.recovery == "":
+                    outcome_counts[OUTCOME_OK] += 1
+        for cand in res.candidate_records:
+            all_candidates.append(cand)
         for cap in res.caption_records:
             if cap.recovery == "10s_slices":
                 outcome_counts["10s_slices"] += 1
@@ -1664,10 +2540,38 @@ def main():
     total_out = sum(u.usage["completion_tokens"] for u in all_usage)
     total_cached = sum(u.usage["cached_tokens"] for u in all_usage)
     n_ok = len(all_records)
+
+    # Per-stage call counts (every call carries stage + call_index in the usage file).
+    n_generate_calls = sum(1 for u in all_usage if u.stage == "generate")
+    n_refine_calls = sum(1 for u in all_usage if u.stage == "refine")
+    n_baseline_calls = sum(1 for u in all_usage if u.stage == "baseline")
+    n_critic_calls = sum(1 for u in all_usage if u.stage == "critic")
+
+    # Clip-level critic outcomes, derived from the final records' critic sub-object.
+    n_critic_ran = n_critic_skipped_single = n_critic_failed = 0
+    n_baseline_failed = n_refined = n_adopted = 0
+    for cap in all_records:
+        c = cap.critic
+        if not isinstance(c, dict) or not c.get("enabled"):
+            continue
+        if c.get("skipped") == "single_valid":
+            n_critic_skipped_single += 1
+        elif c.get("failed") == "baseline_failed":
+            n_baseline_failed += 1
+        elif c.get("failed") == "critic_failed":
+            n_critic_failed += 1
+        else:
+            n_critic_ran += 1
+            if c.get("refined"):
+                n_refined += 1
+        if cap.recovery == "adopted":
+            n_adopted += 1
+
     summary = {
         "model": args.model, "participant": args.participant, "day": args.day,
         "time_range": {"start": args.start_time, "end": args.end_time},
         "clip_duration": args.clip_duration, "thinking": args.thinking, "json_mode": json_mode,
+        "best_of_n": args.best_of_n, "refine_samples": args.refine_samples,
         "temperature": (1.0 if args.thinking == "disabled" else None),
         "max_rpm": args.max_rpm, "api_workers": args.api_workers,
         "preprocess_workers": args.preprocess_workers,
@@ -1679,11 +2583,19 @@ def main():
         "n_empty": outcome_counts[OUTCOME_EMPTY],
         "n_recovery_10s": outcome_counts["10s_slices"],
         "n_first_attempt_rejection": outcome_counts["first_attempt_rejection"],
+        "calls": {"generate": n_generate_calls, "refine": n_refine_calls,
+                  "baseline": n_baseline_calls, "critic": n_critic_calls,
+                  "total": len(all_usage)},
+        "n_candidates": len(all_candidates),
+        "critic": {"ran": n_critic_ran, "skipped_single_valid": n_critic_skipped_single,
+                   "critic_failed": n_critic_failed, "baseline_failed": n_baseline_failed,
+                   "refined": n_refined, "adopted_records": n_adopted},
         "elapsed_s": round(elapsed, 2),
         "effective_rpm": round(results_received / max(elapsed / 60, 1e-9), 2),
         "tokens": {"total_in": total_in, "total_out": total_out, "total_cached": total_cached},
         "round_breakdown": [
-            {"clip_id": u.clip_id, "global_idx": u.global_idx, "in": u.usage["prompt_tokens"],
+            {"clip_id": u.clip_id, "global_idx": u.global_idx, "stage": u.stage,
+             "call_index": u.call_index, "in": u.usage["prompt_tokens"],
              "out": u.usage["completion_tokens"], "cached": u.usage["cached_tokens"],
              "latency_s": u.latency_s, "recovery": u.recovery,
              "raw_content_preview": (u.raw_content or "")[:200]}
@@ -1698,12 +2610,20 @@ def main():
              f"first_rejection={outcome_counts['first_attempt_rejection']} "
              f"safety={outcome_counts[OUTCOME_SAFETY]} parse_failed={outcome_counts[OUTCOME_PARSE_FAILED]} "
              f"empty={outcome_counts[OUTCOME_EMPTY]} recovered_10s={outcome_counts['10s_slices']}")
+    if args.best_of_n > 1:
+        log.info(f"  best_of_n={args.best_of_n}: generate={n_generate_calls} refine={n_refine_calls} "
+                 f"baseline={n_baseline_calls} critic={n_critic_calls} candidates={len(all_candidates)} "
+                 f"critic_ran={n_critic_ran} single_valid={n_critic_skipped_single} "
+                 f"critic_failed={n_critic_failed} baseline_failed={n_baseline_failed} "
+                 f"refined={n_refined} adopted={n_adopted}")
     log.info(f"  elapsed={elapsed:.1f}s ({elapsed/60:.1f}min)  "
              f"effective_rpm={results_received / max(elapsed / 60, 1e-9):.1f}")
     log.info(f"  tokens: in={total_in} out={total_out} cached={total_cached}")
     if n_ok:
         log.info(f"  unique narratives: {unique}/{n_ok}")
     log.info(f"  captions -> {out_file}")
+    if args.best_of_n > 1:
+        log.info(f"  candidates -> {candidates_path}")
     log.info(f"  summary  -> {summary_path}")
 
 

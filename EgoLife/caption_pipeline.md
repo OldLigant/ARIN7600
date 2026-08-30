@@ -135,6 +135,15 @@ python caption_pipeline.py --participant A1_JAKE --day 1
 
 # 只跑 caption（slices 已在 _cache/ 里，跳过编码）
 python caption_pipeline.py --skip-preprocess
+
+# best-of-N：每个片段独立采样 4 次（每次调用带 call_index 序号），两阶段 critic
+# （C1a 只看片的基线抽取 + C1b 评审）选出最优候选；best 不达标时按 critic 的
+# regeneration_guidance 带反馈重生成（G2）再评一轮（C2b 复用 C1a 基线）
+python caption_pipeline.py --participant A1_JAKE --day 1 --best-of-n 4 --refine-samples 2
+
+# best-of-N 中断后续传：_candidates.jsonl 里已有的候选直接复用，
+# 只补缺失的调用序号；旧单次模式的主记录会被采纳为候选 0
+python caption_pipeline.py --best-of-n 4 --skip-existing
 ```
 
 ### 默认目录布局
@@ -152,7 +161,10 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
     └── A1_JAKE/
         └── DAY1/
             ├── 1110-1130.jsonl              <- 主输出（文件名带时间范围）
-            ├── 1110-1130_usage.jsonl        <- 每次调用的 token/延迟
+            ├── 1110-1130_candidates.jsonl   <- best-of-N 候选 sidecar（N≥2 时生成：
+            │                                  每行一个 (clip_id, call_index) 采样，
+            │                                  断点续传按它复用已有标注）
+            ├── 1110-1130_usage.jsonl        <- 每次调用的 token/延迟（带 stage/call_index）
             ├── 1110-1130_summary.json       <- 汇总统计
             ├── 1110-1130_run.log            <- 运行日志
             └── _cache/                      <- 中间产物（可删）
@@ -244,6 +256,34 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 
 > **schema 沿革**：2026-08 大重构后统一为上（`environment` 对象 + `people`/`sound`/`interface`/`mental_activity`；移除 `tags`/`ocr`/`others`/`awareness`；sectioned 兜底解析已删除，JSON 失败即 `parse_failed`）。历史输出文件里的行保持生成时的旧形状，解析器**不再**做旧→新映射；重跑后所有新行均为新形状。下游消费 jsonl 时请按行判断字段存在性。
 
+### best-of-N / critic 扩展字段（N≥2 时）
+
+所有行新增三个可回溯字段（N=1 的旧行没有，按字段存在性判断）：
+
+- `best_of_n`：本次运行每片段采样数（旧单次模式为 1）。
+- `thinking`：本次运行的 thinking 配置（`enabled`/`disabled`）。
+- `critic`：critic 子对象（N=1 时为 `null`）：
+  - 正常评审后：`{enabled, baseline: {verification_baseline, tokens}, candidates: [{call_index, weighted_total}], evaluation: {baseline_corrections, best_index, needs_regeneration, regeneration_guidance, tokens}, refined}`；
+  - 只有 1 份有效候选：`{enabled, skipped: "single_valid"}`（跳过 critic 直接保留）；
+  - 基线/评审失败：`{enabled, failed: "baseline_failed" | "critic_failed"}`（保留首份有效候选）。
+
+**候选 sidecar `{stem}_candidates.jsonl`**（每行一个采样）：
+
+```jsonc
+{"clip_id": "DAY1_A1_JAKE_11100000_p1", "global_idx": 1, "call_index": 0,
+ "stage": "generate", "narrative": "{模型原始 JSON 全文}", "model": "mimo-v2.5",
+ "ts_captioned": "...", "tokens": {"in": 3200, "out": 210, "cached": 747}, "recovery": "ok"}
+```
+
+- `stage`：`generate`（G1 采样）/ `refine`（G2 重生成，仅追溯，续传不复用）。
+- 每次 API 调用（生成/重生成/基线/评审）都会写一条 `UsageRecord` 到 `_usage.jsonl`，
+  并带 `stage`（generate/refine/baseline/critic）与 `call_index`（生成类调用 0-based 序号，其余为 -1）。
+
+**断点续传语义（best-of-N）**：完成判定是模式感知的——只有"最后一条主记录满足当前
+`best_of_n` + `thinking` + 含 `critic` 标记"才算完成。变更 `--best-of-n` 或 `--thinking`
+会使旧最终记录失效而重跑，但 **sidecar 候选照常复用**（只补缺失序号），旧单次记录会被
+**采纳为候选 0**。N=1 时任何已有记录都算完成（旧行为）。
+
 ---
 
 ## 5. CLI 参数全表
@@ -280,6 +320,9 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--skip-existing` / `--no-skip-existing` | on | 跳过输出文件里已有的 clip（断点续传） |
 | `--reset` | off | 删除输出文件后重跑 |
 | `--limit` | None | 只处理前 N 个 clip（调试） |
+| **best-of-N** | | |
+| `--best-of-n` | `1` | 每片段采样次数。`1` = 旧单次调用（无 critic）。`N≥2` 跑 best-of-N：G1 采样 N 次（每次带 call_index 序号）→ 两阶段 critic（C1a 只看片的基线抽取 + C1b 评审选优）→ best 不达标时带 `regeneration_guidance` 重生成（G2）→ C2b 复用 C1a 基线再评。续传复用 sidecar 候选、只补缺失序号；旧单次主记录采纳为候选 0。critic 需 ≥2 份有效候选；1 份直接保留，0 份走现有失败/10s 兜底 |
+| `--refine-samples` | `2` | G2 重生成采样数（仅 critic 判 `needs_regeneration` 时触发；0 = 关闭重生成） |
 
 ---
 
@@ -303,7 +346,9 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
   - `--clip-duration 30`（不切分）：30s 被拒 → retry 一次 → 切 10s 各调一次 → 放弃（旧的三级链路）。
   - `--clip-duration < 30`（切分模式，默认）：片段被拒 → retry 一次 → 放弃（已是最小粒度，不再细切）。
   所有 recovery 调用都过同一限速器。
-- **断点续传**：默认开，读输出文件的 `clip_id` 集合跳过已完成；切分阶段也跳过已存在 slice。
+- **断点续传（模式感知）**：默认开。N=1 时读输出文件跳过已完成（旧行为）；best-of-N 时按
+  "最后一条主记录满足当前 `best_of_n` + `thinking` + 含 `critic` 标记"判定完成，sidecar 候选
+  复用、只补缺失序号（见 §4 与 §6 的 best-of-N 小节）。切分阶段也跳过已存在 slice。
 
 ### 错误分类（summary.json 里分项计数）
 
@@ -314,6 +359,39 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 - `first_attempt_rejection`：首次被拒（safety/parse/empty），已自动 retry——Mimo 的常见行为，retry 命中前缀缓存（1/50 价）几乎必成。
 
 失败时原始模型输出存进 `UsageRecord.raw_content`（summary 的 `round_breakdown` 里也有前 200 字预览），便于事后排查。
+
+### best-of-N + 两阶段 critic 工作流（`--best-of-n N≥2`）
+
+每个 clip 在 API worker 内跑一个状态机（G1 串行采样，与其他 clip 的 worker 并行）：
+
+```
+G1  补齐 call_index 0..N-1：复用 sidecar 候选 + 采纳旧主记录为候选 0，
+    只对缺失序号发生成调用（坏 JSON 丢弃；首次被拒自动 retry 一次）
+        │ 有效候选 = 0 → 现有失败/10s-slices 兜底（兜底切片按单次调用）
+        │ 有效候选 = 1 → 直接保留（critic.skipped = "single_valid"）
+        ▼ 有效候选 ≥ 2
+C1a  只看片基线抽取（视频 + 元数据，不见候选）→ verification_baseline
+        │ 基线失败 → 保留首份有效候选（critic.failed = "baseline_failed"）
+        ▼
+C1b  评审（视频 + 基线 + 全部候选）→ best_index / 分数 / needs_regeneration
+        │ 评审失败 → 保留首份有效候选（critic.failed = "critic_failed"）
+        ▼ best 不达标（needs_regeneration）
+G2   带 regeneration_guidance 重生成 refine_samples 次（stage="refine"）
+        ▼
+C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最终 best
+     （无论分数如何收尾；C2b 失败则保留 C1b best）
+```
+
+要点：
+
+- **每次调用带序号**：候选落 `{stem}_candidates.jsonl`（键 = `(clip_id, call_index)`），
+  每次 API 调用在 `_usage.jsonl` 里带 `stage` + `call_index`，summary 有分阶段调用计数。
+- **两阶段 critic 抗锚定**：C1a 只发视频，critic 先建立独立基线再读候选；
+  C1b 把基线当 index（非 closed world），候选里基线没提到的内容需回看片段再判。
+- **断点续传（模式感知）**：完成判定 = 最后一条主记录满足当前 `best_of_n` + `thinking`
+  且含 `critic` 标记；不满足则重跑该 clip，但 sidecar 候选全部复用（只补缺失序号），
+  旧单次记录采纳为候选 0。变更 `--best-of-n`/`--thinking` 即触发这种"复用式重跑"。
+- **成本**：每片段调用数 ≈ `N + 2`（G1 + C1a + C1b），低分触发再 `+ M + 1`（G2 + C2b）。
 
 ---
 
@@ -331,6 +409,15 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
   解析器会剥围栏后照常解析；模型完全脱轨输出非 JSON 文本时直接 `parse_failed`（原始输出留在
   `raw_content`，retry 一次通常即恢复）。
 - **单 participant 单 day**：跨天/跨参与者需起多个进程，注意共享 RPM 配额（调低单进程 `--max-rpm`）。
+- **best-of-N 成本高**：每片段约 `N+2` 次调用（低分再 `+M+1`），即 `--best-of-n 4` 约是单次的 6 倍
+  （含 G2 最坏 9 倍）。视频在 C1a 与 C1b 各发一次。省钱：`N=3`、`--refine-samples 0`、C1a 关 thinking（若实测基线质量不受影响）。
+- **thinking 下候选可能趋同**：MiMo 在 thinking 模式忽略 temperature，N 份 G1 候选可能高度相似，
+  选优退化为"选第一份"。可观察候选间编辑距离 / critic 分数方差，必要时 G1 一半样本关 thinking
+  （temperature=1.0）换取多样性（详见 `tmp/best_of_n_critic方案计划_v1.md`）。
+- **兜底切片与 G2 候选**：30s 模式全失败后的 10s-slices 兜底按**单次调用**标注（不套 best-of-N/critic）；
+  G2 的 refine 候选只做追溯，中断后续传不复用（会重跑 G2）。
+- **critic 与生成同源**：critic 默认与生成同模型，可能对自己的典型幻觉不敏感——两阶段结构
+  （C1a 不见候选）与 `baseline_corrections` 显式纠正是主要缓解，必要时换异构模型做 critic。
 
 ---
 
@@ -340,6 +427,7 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 |---|---|
 | 标准跑（因果标注质量优先） | 默认即可（`--max-rpm 90`，api-workers 自动 = min(rpm/2, 20) = 20；thinking on, 10s 切分。RPM 用不满 90 属预期，单机不为吃满配额堆连接） |
 | 大批量、预算敏感 | `--thinking disabled --max-rpm 95 --api-workers 8`（放弃推理链，留意 429） |
+| best-of-N 幻觉压制 | `--best-of-n 4 --refine-samples 2` | 每片段约 6–9 次调用；建议先 `--limit` 小样本核对 critic 选优与 `verification_baseline` 质量再全量跑 |
 | 调试 prompt | `--limit 3 --api-workers 1`（串行，便于看日志） |
 
 **吞吐估算**：RPM 上限不变（90 RPM ≈ 5400 clip/h 的**调用数**上限），但 thinking 单次延迟 ×3-4、
