@@ -12,6 +12,7 @@ EgoLifeCap/
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # --- Caption pipeline intermediate/cache outputs ---
 # Keep only the main annotation jsonl; drop usage logs, run logs, summaries,

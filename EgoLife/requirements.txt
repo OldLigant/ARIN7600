@@ -1,12 +1,18 @@
 # caption_pipeline.py
 openai>=1.0
 pandas>=2.0
+pyarrow>=14.0       # parquet engine for clips.parquet (required for --skip-preprocess / resume)
 python-dotenv>=1.0
 jsonschema>=4.0
 tqdm>=4.65
 
 # download_video.py (and download_egolifecap.py --method hf)
 huggingface_hub>=0.20
+
+# Install into a virtualenv with uv:
+#   uv venv .venv
+#   uv pip install -r requirements.txt
+#   .\.venv\Scripts\activate        (Windows)  /  source .venv/bin/activate
 
 # NOTE: ffmpeg/ffprobe must also be installed and on PATH (not a pip package).
 #   Windows: winget install Gyan.FFmpeg

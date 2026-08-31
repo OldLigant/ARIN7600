@@ -9,10 +9,30 @@ emotion drives actions, actions mutate the environment, the environment feeds
 back into both actions and emotion. Every `causal_links` edge carries a counterfactual
 `strength` (strong/moderate/weak), so the causal graph is weighted, not just binary.
 
+Two-stage annotation per clip:
+  P1 BASIC  the observable layers, sampled straight from the footage: environment,
+            people, self_actions / other_actions, env_changes, speech, sound,
+            interface (screens / legible text). Best-of-N sampling plus a two-phase
+            critic (watch-only baseline extraction, then evaluation with guided
+            regeneration) picks one VERIFIED basic annotation. The critic only ever
+            judges these observable layers.
+  P2 INFER  psychology (emotion / mental_activity) and causal_links, inferred in a
+            SINGLE extra call on top of the winning basic annotation — grounded in
+            the footage plus that annotation. No critic: these layers are inference,
+            not perception.
+
+All four call types (G1/G2 generate, C1a baseline, C1b/C2b critic, P2 inference) share ONE
+system prompt (SHARED_SYSTEM_MSG), routed by a "TASK:" marker on the first line of the user
+message. Every call for the same clip therefore carries the identical "system + video" prefix
+and hits the provider's prefix cache — the video tokens are processed (and billed) in full
+only once per clip.
+
 By default each ~30s source file is split into 3 x ~10s pieces and each piece is
 captioned independently (finer granularity, lower per-call rejection rate). Use
 --clip-duration to choose a different split target (5/6/10/15/30); 30 disables
-splitting (one caption per source file, the legacy behaviour).
+splitting (one caption per source file, the legacy behaviour). Frames are encoded
+at 1 fps by default, matching the target deployment environment (one image per
+second outside the EgoLife dataset).
 
 Single file, no sibling-module imports. Depends only on the OpenAI SDK,
 pandas, python-dotenv, jsonschema, and ffmpeg/ffprobe on PATH.
@@ -25,12 +45,13 @@ Architecture
 
 Usage
 -----
-  # standard run: 10s pieces (default), JSON output, thinking ON (causal
-  # annotation is reasoning-heavy; ~4x latency/tokens vs non-thinking)
+  # standard run: 10s pieces @ 1 fps, thinking OFF, best-of-6 sampling +
+  # two-phase critic on the basic layers, then one inference call per clip
   python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
-  # cheaper/faster: no reasoning chain (action/env layers still fine, causal
-  # links get noticeably weaker)
-  python caption_pipeline.py --thinking disabled
+  # single-call mode: one basic call + one inference call per clip, no critic
+  python caption_pipeline.py --best-of-n 1
+  # deeper per-call reasoning (slower/costlier; lower N to match the cost)
+  python caption_pipeline.py --thinking enabled --best-of-n 2
   # legacy: one caption per 30s source file (no splitting)
   python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
   # time-windowed
@@ -46,6 +67,10 @@ Usage
   # resume a best-of-N run after interruption: existing candidates in the
   # *_candidates.jsonl sidecar are REUSED, only missing call indices are
   # generated, and legacy single-call records are adopted as candidate 0.
+  # full best-of-N trail: every sampled candidate is persisted to
+  # *_candidates.jsonl; every critic-phase output (C1a baseline, C1b critic,
+  # C2b re-critic — raw text + parsed JSON + pool mapping) to *_critique.jsonl,
+  # so discarded candidates and the scoring trail survive for later analysis.
 """
 from __future__ import annotations
 
@@ -88,12 +113,19 @@ ROOT = Path(__file__).resolve().parent  # .../ARIN7600/EgoLife/
 # Constants & prompt
 # ===========================================================================
 
-THINKING_DEFAULT = "enabled"       # causal-graph annotation is reasoning-heavy; disable for ~4x speedup
+# Generation quality now comes from best-of-N sampling + critic selection, not from
+# per-call thinking; disabled is ~4x cheaper/faster per call. Re-enable explicitly
+# for deep-reasoning single-call runs.
+THINKING_DEFAULT = "disabled"
 
-# ffmpeg re-encode defaults (1024x1024 @ 2fps is the validated sweet spot:
-# watermark readable, whiteboard legible, ~2MB / 30s clip).
+# P2 (TASK: INFER — psychology + causal_links) is latent-state reasoning, not perception:
+# it ALWAYS runs with thinking enabled regardless of the global --thinking flag.
+INFERENCE_THINKING = "enabled"
+
+# ffmpeg re-encode defaults. 1 fps matches the target deployment environment, which
+# only captures one image per second outside the EgoLife dataset.
 DEFAULT_RESOLUTION = 1024
-DEFAULT_FPS = 2
+DEFAULT_FPS = 1
 DEFAULT_CRF = 28
 DEFAULT_AUDIO_BITRATE_K = 64
 
@@ -101,19 +133,28 @@ DEFAULT_AUDIO_BITRATE_K = 64
 # break (e.g. the multi-hour gaps in EgoLife). 60s pairing never bridges these.
 _GAP_THRESHOLD_S = 35.0
 
-SYSTEM_MSG = """You are a dense first-person life-log captioner producing SIMULATION-GRADE atomic
-annotations. Your output feeds a digital twin of the wearer's daily life, so it must capture not
-only WHAT happened but the latent and causal structure of the clip: the people present, the
-stateful environment, the wearer's hidden psychology (emotion, mental activity, intent), and the
-directed edges through which emotion drives actions, actions change the environment, and the
-environment feeds back into both.
+# Single shared system prompt for ALL call types (G1/G2 generate, C1a baseline, C1b/C2b
+# critic, P2 inference), assembled section by section below. Every request for the same
+# clip then carries the exact same "system + video" prefix, so the provider's prefix cache
+# is hit on every call after the first and the video tokens (the cost driver) are never
+# reprocessed. The task is routed by the "TASK:" marker on the first line of the user
+# message; clip-specific data must never appear in this prompt (it would break the prefix).
+SHARED_SYSTEM_MSG = """You are a two-stage first-person life-log captioner with verification passes,
+producing SIMULATION-GRADE atomic annotations. Your output feeds a digital twin of the wearer's
+daily life. Each task message names exactly ONE task, routed by the "TASK:" marker on its first
+line:
+  TASK: BASIC     — stage 1: the observable layers, sampled straight from the footage.
+  TASK: BASELINE  — a compact watch-only verification index used to judge BASIC candidates.
+  TASK: CRITIQUE  — strict evaluation of N candidate BASIC annotations against the footage.
+  TASK: INFER     — stage 2: psychology and causal_links on top of a verified BASIC annotation.
+Perform ONLY the named task and output ONLY that task's JSON object.
 
 The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
 
 # Clip sampling (CRITICAL)
-Each clip runs about 10 seconds (never more than ~30s), is downsampled to 2 fps — you receive
-roughly 2 frames per second — and comes WITH its audio track; use what you hear for the speech
-and sound fields. Covering the whole clip is expected.
+Each clip runs about 10 seconds (never more than ~30s), is downsampled to a low frame rate
+(the task message states the exact fps) and comes WITH its audio track; use what you hear for
+the speech and sound fields. Covering the whole clip is expected.
 Motion between consecutive frames can JUMP — hands and objects may teleport between samples.
 Always read timestamps from the watermark, never by counting frames. Fast gestures may be only
 partially captured: describe the visible endpoints honestly and do NOT interpolate unobserved
@@ -128,7 +169,15 @@ The user message tells you the day label and the approximate start time of this 
 You MUST read the watermark to timestamp the actions and changes you describe, so they can be
 located on a timeline. Never transcribe either the watermark or the wearer id as scene text.
 
-# Output format
+============================================================
+# TASK: BASIC — stage 1 annotation (observable layers only)
+============================================================
+Your job is ONLY what is directly observable in the footage and audio: the people present, the
+stateful environment, atomic actions, atomic environment state changes, speech, sounds, and
+screen / text content. Do NOT output emotion, intent, or causality — no psychology field, no
+causal_links field — those belong to the INFER task.
+
+## Output format
 Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
 Use exactly this structure (fill every field; use empty arrays/strings when a section is truly empty):
 
@@ -158,10 +207,6 @@ Use exactly this structure (fill every field; use empty arrays/strings when a se
   ],
   "interface": [
     {"time": "HH:MM:SS", "where": "laptop screen", "app_or_site": "...", "content": "...", "note": ""}
-  ],
-  "psychology": {"emotion": "...", "mental_activity": "..."},
-  "causal_links": [
-    {"type": "env->action", "cause": "...", "effect": "...", "strength": "strong"}
   ]
 }
 
@@ -207,12 +252,12 @@ quantity: a dense 10s of object manipulation may need 6-10 entries; a still 10s 
 honestly be 1-2 entries. Cover the whole clip span. Each "time"/"time_end" is a watermark-based
 HH:MM:SS (~1-3s resolution). Describe only the OBSERVABLE: hand-object contact, posture, gaze,
 locomotion, device use.
-  # Intent ban (CRITICAL): actions and intent live in DIFFERENT fields. This field describes only
-  what is observed: postures, contacts, movements. Never write 准备 / 打算 / 想要 / 试图 to do X
-  here unless X is actually observed within this clip. If the clip ends mid-activity, the last
-  action simply ends there. An unmade bed does NOT license "准备整理床铺" unless tidying is
-  actually observed. Intent, plans and goals are LATENT states — they belong in
-  psychology.mental_activity, and must never leak into actions, env_changes, or causal_links.
+  # Intent ban (CRITICAL): this stage records only what is observed: postures, contacts,
+  # movements. Never write 准备 / 打算 / 想要 / 试图 to do X here unless X is actually observed
+  # within this clip. If the clip ends mid-activity, the last action simply ends there. An unmade
+  # bed does NOT license "准备整理床铺" unless tidying is actually observed. Intent, plans and
+  # goals are LATENT states for the later inference pass — they must never leak into any field
+  of this basic annotation.
 
 other_actions: zero or more objects, same shape and same atomicity standard as self_actions,
 timestamped the same way, plus a "person" field carrying the id from people. Lead the text with
@@ -260,66 +305,20 @@ anchored with its "time". "note" records legibility caveats ("标题只露出前
 off-frame"). Do NOT transcribe the top-left watermark or the top-right wearer id. Transcribe only
 what is actually legible; never invent. Empty array if no screen or text surface appears.
 
-psychology: an object with exactly two keys, estimated AS IF THIS CLIP WERE YOUR ONLY EVIDENCE —
-ignore anything that might have happened before it. The question is: "considering only this
-clip's situation, what would a plausible inner state be?"
-  emotion: one or two lowercase keywords (required; "neutral" if none readable), picked from:
-    neutral calm relaxed bored focused amused happy excited surprised confused curious anxious
-    nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
-  mental_activity: one or two short sentences of plausible ongoing thought, in first person: what
-    has my attention right now, what I am mulling over, and — where the clip's situation alone
-    supports it — my INTENT: what I seem to be getting done next. This is the ONLY field where
-    intent may appear. Ground every word in this clip's visible situation; when the clip offers
-    no inner-state cues, an honest "无特别线索，注意力在手头的事情上" beats an invented agenda.
-When an environment event or another person moved my emotion or thought, say so here AND record
-it as an "env->emotion" / "other->emotion" causal_link.
-
-causal_links: the directed causal edges you can observe or confidently infer WITHIN this clip.
-One object per edge: {"type": "...", "cause": "<short phrase, prefix with HH:MM:SS when clear>",
-"effect": "<short phrase, prefix with HH:MM:SS when clear>", "strength": "strong|moderate|weak"}.
-Use EXACTLY these "type" strings:
-  "env->action"     an environment event/state changed MY behavior (phone vibrates -> I pick it up).
-  "env->emotion"    an environment event changed my emotion (loud noise -> startled/annoyed).
-  "emotion->action" my emotion directly drove my behavior (bored -> I start scrolling my phone).
-  "action->env"     my action changed the environment (I flip the switch -> lights turn on);
-                    mirrors env_changes entries with cause "self".
-  "other->action"   another person's action triggered my action (colleague waves me over -> I walk over).
-  "other->env"      another person's action changed the environment (she opens the curtain -> room brightens).
-  "other->emotion"  another person's action changed my emotion (guest laughs -> I relax).
-  "env->env"        an environmental event with NO visible agent causes another environmental
-                    change (云遮住阳光 -> 室内变暗; 风把门吹开).
-Every edge carries a REQUIRED "strength" grading how strongly the cause drove the effect,
-defined counterfactually:
-  strong  = trigger: without this cause the effect likely would NOT have happened, or would have
-            gone a different direction (phone vibrates -> I pick it up; I flip the switch ->
-            lights on).
-  moderate= shaper: the cause changed HOW/WHEN/how vigorously the effect happened, but the effect
-            would still have occurred (boredom speeds up my scrolling; his tone makes me answer
-            more carefully).
-  weak    = background: one contributory factor among several; the effect was mostly driven by
-            habit or task (mild tiredness -> I rub my eyes once).
-Physical edges (action->env, other->env) will almost always be "strong" — that is expected, not
-lazy. Grade honestly; do not pad the graph with weak background edges.
-Rules: the causal direction must be visible or strongly implied by temporal order and mechanism —
-never fabricate; omit an edge only when you doubt it EXISTS (strength "weak" is the honest way to
-record a real but minor influence). 0-3 links is typical; empty array is fine. Quote the atomic
-action / change texts (with their times) rather than vague summaries.
-
 # Rules
 - Stay strictly within the watermark time range of THIS clip; never describe other videos.
-- Be concrete and observational; do not speculate beyond what is visible or audible. The single
-  exception is psychology, which is explicitly an inference field — but it too must be grounded
-  in this clip alone. causal_links must stay evidence-based (visible temporal order + plausible
-  mechanism).
+- Be concrete and observational; do not speculate beyond what is visible or audible. Emotion,
+  intent and causal analysis are handled by the later inference pass — keep them out entirely.
 - Pick ONE language for all fields based on the dominant spoken language in the clip (Chinese if
   participants speak Chinese, English otherwise). Do NOT translate or duplicate content.
 - Output each action, utterance, or fact exactly ONCE; never repeat in another language.
 - Output must be valid JSON: double quotes, no trailing commas, no comments."""
 
 USER_TASK_TMPL = (
+    "TASK: BASIC — stage 1 annotation (observable layers only).\n"
     "Annotate this {duration_desc} first-person video ({clip_id}) and return the JSON object.\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
-    "The clip is downsampled to 2 fps with its audio track included: read the top-left watermark "
+    "The clip is downsampled to {fps} fps with its audio track included: read the top-left watermark "
     "(HH:MM:SS:FF / {day_label}, two lines) to timestamp self_actions, other_actions, env_changes, "
     "and any visually anchored sounds or screen page changes — never time anything by counting "
     "frames. Cover the full segment from {start_hms} onward.\n"
@@ -328,34 +327,31 @@ USER_TASK_TMPL = (
     "need no object) and ATOMIC environment state changes — there is NO count quota; atomicity is "
     "the standard. Transcribe speech, log notable non-speech sounds, and for any screen on camera "
     "identify the app/site, the page type and its key visible text (bilibili 视频标题 + UP主, "
-    "知乎 问题 + 回答, 文件资源管理器里的文件名, ...). Keep actions strictly observable — intent "
-    "belongs only in psychology.mental_activity. Then record every causal edge you can defend from "
-    "the clip itself: env->action, env->emotion, emotion->action, action->env, other->action, "
-    "other->env, other->emotion, env->env — each graded strength strong/moderate/weak by how "
-    "strongly the cause drove the effect."
+    "知乎 问题 + 回答, 文件资源管理器里的文件名, ...). Keep everything strictly observable — "
+    "emotion, intent and causal analysis belong to a later inference pass: output ONLY the basic "
+    "fields (environment, people, self_actions, other_actions, env_changes, speech, sound, "
+    "interface), never psychology or causal_links."
 )
 
 
 # ===========================================================================
-# Critic prompts (best-of-N two-phase: C1a baseline extraction + C1b evaluation)
+# Critic sections of SHARED_SYSTEM_MSG + user templates
+# (best-of-N two-phase: C1a baseline extraction + C1b evaluation)
 # Design record: tmp/第一人称视频标注critic提示词_v2.txt
 # ===========================================================================
 
-CRITIC_BASELINE_SYSTEM_MSG = """You build the VERIFICATION BASELINE for a first-person life-log clip. A
-separate critic pass will later judge candidate annotations of this same clip against this baseline,
-so your job is to watch the footage and write a compact, factual INDEX of what you verified happened.
-This is NOT an annotation: it is scaffolding for verification. Keep it short and stop when done.
+SHARED_SYSTEM_MSG += """
 
-The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
+============================================================
+# TASK: BASELINE — verification index (watch-only)
+============================================================
+You build the VERIFICATION BASELINE for the clip. A separate CRITIQUE task will later judge
+candidate annotations of this same clip against this baseline, so your job is to watch the
+footage and write a compact, factual INDEX of what you verified happened. This is NOT an
+annotation: it is scaffolding for verification. Keep it short and stop when done. The clip
+sampling and watermark rules above are the same rules the annotators followed.
 
-# Clip sampling (the same rules the annotators followed)
-Each clip runs about 10 seconds (never more than ~30s), downsampled to 2 fps, WITH audio. Motion
-between consecutive frames can JUMP — hands and objects may teleport between samples. Read timestamps
-ONLY from the top-left watermark (line 1 "HH:MM:SS:FF", line 2 "DAYn"), never by counting frames. The
-top-right corner carries the wearer id (e.g. "A1_JAKE"). Never transcribe the watermark or the wearer
-id as scene content.
-
-# What to write
+## What to write
 Return ONLY a JSON object with a single key "verification_baseline" containing:
 - "scene": 1-2 sentences: setting, key near-field objects, people present.
 - "near_field": short phrases, one per notable NEAR-FIELD object I or others might interact with
@@ -394,9 +390,10 @@ Return ONLY a JSON object with a single key "verification_baseline" containing:
 """
 
 CRITIC_BASELINE_USER_TASK_TMPL = (
+    "TASK: BASELINE — watch-only verification index.\n"
     "Build the verification baseline for this {duration_desc} first-person video ({clip_id}).\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
-    "The clip is downsampled to 2 fps with its audio track included: read the top-left watermark "
+    "The clip is downsampled to {fps} fps with its audio track included: read the top-left watermark "
     "(HH:MM:SS:FF / {day_label}, two lines) to timestamp key_events and visually anchored sounds or "
     "screens — never by counting frames.\n"
     "Watch the WHOLE clip, then write the compact verification_baseline JSON: scene, near_field "
@@ -406,9 +403,17 @@ CRITIC_BASELINE_USER_TASK_TMPL = (
     "Return ONLY the verification_baseline JSON object.\n"
 )
 
-CRITIC_SYSTEM_MSG = """You are a STRICT annotation critic for first-person life-log captions. You receive
-the SAME video clip (with its audio track) that N candidate annotators independently described, a
-verification_baseline for this clip (built in a separate watch-only pass), and the N JSON annotations.
+SHARED_SYSTEM_MSG += """
+
+============================================================
+# TASK: CRITIQUE — strict evaluation of N BASIC candidates
+============================================================
+You are a STRICT annotation critic. You receive the SAME video clip (with its audio track) that N
+candidate annotators independently described, a verification_baseline for this clip (built in a
+separate watch-only BASELINE task), and the N JSON annotations. The candidates are BASIC
+annotations — environment, people, self/other actions, env_changes, speech, sound, interface.
+They deliberately contain NO psychology and NO causal_links (the INFER task adds those later):
+never flag the absence of either as an omission.
 Your job, in order:
   1. review the baseline, re-watch the footage as needed, and verify each candidate against the
      ACTUAL footage,
@@ -421,20 +426,15 @@ You are the last line of defense against hallucination. A fluent, detailed, well
 that invents content is WORSE than a sparse but honest one. Score accordingly. Never reward verbosity;
 never punish honest uncertainty ("一个贴有标签的半透明玻璃容器，距离过近细节模糊" is GOOD annotating, not a weakness).
 
-The footage is from participant A1_JAKE wearing Meta Aria glasses. People may speak Chinese or English.
-
-# Clip sampling (the same rules the annotators followed)
-Each clip runs about 10 seconds (never more than ~30s), downsampled to 2 fps, WITH audio. Motion
-between consecutive frames can JUMP — hands and objects may teleport between samples. Annotators were
-told to describe visible endpoints honestly and NOT interpolate unobserved micro-steps: do not flag
-missing intermediate micro-steps as omissions, but DO flag invented interpolated steps as
-hallucinations. Every frame carries a watermark in the TOP-LEFT corner: line 1 "HH:MM:SS:FF" (FF is a
-frame counter 00-19), line 2 the day label "DAYn". A wearer id sits in the TOP-RIGHT corner.
-Timestamps in the candidates must be verifiable against this watermark. The watermark and wearer id
+## The rules the annotators followed
+The TASK: BASIC section above is the rulebook the annotators worked under — including describing
+visible endpoints honestly and NOT interpolating unobserved micro-steps: do not flag missing
+intermediate micro-steps as omissions, but DO flag invented interpolated steps as hallucinations.
+Timestamps in the candidates must be verifiable against the watermark. The watermark and wearer id
 themselves must never appear as scene text in a candidate — if one transcribes them, that is a rule
 violation.
 
-# The verification_baseline (provided with this task)
+## The verification_baseline (provided with this task)
 A separate watch-only pass built "verification_baseline" for this clip: scene, a near_field object
 inventory, a key_events timeline, an audio_gist (speech turns + notable non-speech sounds), and
 screens (device + app/site only). Use it as your PRIMARY reference for what the footage shows: check
@@ -469,8 +469,8 @@ C. TIMESTAMP ACCURACY: spot-check several entries against the watermark. Times m
 D. RULE COMPLIANCE (the annotators' schema rules):
    - atomicity: compound entries that merge separate manipulations ("我拿起手机划开屏幕看消息" as one
      entry) OR artificial micro-splits of one continuous gesture;
-   - intent ban: 准备 / 打算 / 想要 / 试图 leaking into self_actions, other_actions, env_changes or
-     causal_links (intent belongs ONLY in psychology.mental_activity);
+   - intent ban: 准备 / 打算 / 想要 / 试图 leaking into self_actions, other_actions or env_changes
+     (latent states are out of scope for the basic stage);
    - object-name anchoring: the same object renamed between near_field / actions / env_changes /
      causal_links (check against the baseline's near_field inventory);
    - people ids: stable id + descriptor reused everywhere; names only when actually spoken or shown;
@@ -478,24 +478,18 @@ D. RULE COMPLIANCE (the annotators' schema rules):
    - environment is a snapshot (no timestamps inside it); sound entries carry "time" only when
      visually anchored; interface entries present only when a screen/text surface is actually visible;
    - every action/utterance/fact output exactly once, no duplication.
-E. CAUSAL QUALITY: each causal_links edge must be visible or strongly implied by temporal order +
-   mechanism; type string must be one of the 8 allowed values; strength grading must follow the
-   counterfactual definitions (strong = trigger, moderate = shaper, weak = background). Flag
-   fabricated edges and padded weak-edge stuffing; do not penalize physical action->env edges for
-   being "strong" — that is expected.
 
 # Scoring rubric (integers 0-10 per dimension)
-  faithfulness        weight 0.40 — absence of invented content (A). Any FATAL issue caps
+  faithfulness        weight 0.45 — absence of invented content (A). Any FATAL issue caps
                      faithfulness at 3. FATAL = invented speech, invented person, fabricated
                      screen content, or a wholesale invented action sequence.
-  coverage           weight 0.20 — completeness of major actions / env changes / speech / interface
+  coverage           weight 0.25 — completeness of major actions / env changes / speech / interface
                      over the whole clip span (B).
   timestamp_accuracy weight 0.15 — watermark correctness of the spot-checked entries (C).
   rule_compliance    weight 0.15 — atomicity, intent ban, anchoring, ids, language, schema field
                      rules (D).
-  causal_quality     weight 0.10 — evidence-based edges, correct types, honest strength (E).
-Compute weighted_total = 0.40*faithfulness + 0.20*coverage + 0.15*timestamp_accuracy
-+ 0.15*rule_compliance + 0.10*causal_quality, rounded to one decimal.
+Compute weighted_total = 0.45*faithfulness + 0.25*coverage + 0.15*timestamp_accuracy
++ 0.15*rule_compliance, rounded to one decimal.
 
 # Output format
 Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
@@ -510,12 +504,11 @@ Use exactly this structure:
         "faithfulness": 0,
         "coverage": 0,
         "timestamp_accuracy": 0,
-        "rule_compliance": 0,
-        "causal_quality": 0
+        "rule_compliance": 0
       },
       "weighted_total": 0.0,
       "issues": [
-        {"severity": "fatal|major|minor", "type": "hallucination|omission|timestamp|atomicity|intent_leak|naming|language|schema|causal|other", "field": "self_actions[2]", "detail": "what is wrong", "evidence": "what the footage/watermark actually shows, with HH:MM:SS when relevant"}
+        {"severity": "fatal|major|minor", "type": "hallucination|omission|timestamp|atomicity|intent_leak|naming|language|schema|other", "field": "self_actions[2]", "detail": "what is wrong", "evidence": "what the footage/watermark actually shows, with HH:MM:SS when relevant"}
       ],
       "summary": "one-sentence verdict"
     }
@@ -549,16 +542,17 @@ Use exactly this structure:
       没有出现在画面里");
     * what to ADD: missed events with their watermark times ("11:09:44 左右我把杯子放回桌面，补一条
       self_action 和对应的 env_change");
-    * what to FIX: wrong timestamps, renamed objects, intent leaks, mis-graded causal edges.
+    * what to FIX: wrong timestamps, renamed objects, intent leaks.
   Cover the union of the important issues across ALL candidates (the best one's flaws first), so one
   regeneration round can fix everything at once. Keep it under ~200 words.
 - Output must be valid JSON: double quotes, no trailing commas, no comments."""
 
 CRITIC_USER_TASK_TMPL = (
+    "TASK: CRITIQUE — evaluate the candidate BASIC annotations.\n"
     "Critique {n_candidates} candidate annotations of this {duration_desc} first-person video ({clip_id}).\n"
     "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
     "A verification_baseline for this clip (built in a separate watch-only pass) is provided below — "
-    "use it as your primary reference for what the footage shows. The clip is downsampled to 2 fps "
+    "use it as your primary reference for what the footage shows. The clip is downsampled to {fps} fps "
     "with its audio track included: verify every timestamped claim against the top-left watermark "
     "(HH:MM:SS:FF / {day_label}, two lines) — never by counting frames.\n"
     "Review the baseline and re-watch the footage as needed, then evaluate each candidate strictly "
@@ -576,6 +570,136 @@ CRITIC_USER_TASK_TMPL = (
 
 
 # ===========================================================================
+# P2 inference section of SHARED_SYSTEM_MSG + user template
+# (psychology + causal_links on top of the chosen basic annotation)
+# ===========================================================================
+
+SHARED_SYSTEM_MSG += """
+
+============================================================
+# TASK: INFER — stage 2 inference (psychology + causal_links)
+============================================================
+A BASIC task already produced the verified BASIC annotation of this clip: an environment snapshot,
+the people cast, atomic self/other actions, atomic environment changes, speech, sounds, and screen
+content. Your job is ONLY the two latent layers that task deliberately excluded:
+  1. psychology — the wearer's plausible inner state (emotion + mental_activity), and
+  2. causal_links — directed, strength-graded causal edges among environment / actions / others /
+     emotion.
+You receive the SAME footage (with its audio track) plus that BASIC annotation. Ground every
+inference in BOTH: reuse the annotation's object names, person ids, action/change texts and their
+watermark times VERBATIM — never invent objects, people, actions or utterances that are not in it,
+and never contradict it.
+
+## Output format
+Return ONLY a single JSON object. No explanations, no markdown code fences, no text outside JSON.
+Use exactly this structure (fill every field; empty array when a section is truly empty):
+
+{
+  "psychology": {"emotion": "...", "mental_activity": "..."},
+  "causal_links": [
+    {"type": "env->action", "cause": "...", "effect": "...", "strength": "strong"}
+  ]
+}
+
+## Field rules
+
+psychology: an object with exactly two keys, estimated AS IF THIS CLIP WERE YOUR ONLY EVIDENCE —
+ignore anything that might have happened before it. The question is: "considering only this
+clip's situation, what would a plausible inner state be?"
+  emotion: one or two lowercase keywords (required; "neutral" if none readable), picked from:
+    neutral calm relaxed bored focused amused happy excited surprised confused curious anxious
+    nervous stressed frustrated angry embarrassed sad tired sleepy hungry, or similar.
+  mental_activity: one or two short sentences of plausible ongoing thought, in first person: what
+    has my attention right now, what I am mulling over, and — where the clip's situation alone
+    supports it — my INTENT: what I seem to be getting done next. This is the ONLY field where
+    intent may appear. Ground every word in this clip's visible situation (footage + basic
+    annotation); when the clip offers no inner-state cues, an honest "无特别线索，注意力在手头的
+    事情上" beats an invented agenda.
+When an environment event or another person moved my emotion or thought, say so here AND record
+it as an "env->emotion" / "other->emotion" causal_link.
+
+causal_links: the directed causal edges you can observe or confidently infer WITHIN this clip.
+One object per edge: {"type": "...", "cause": "<short phrase, prefix with HH:MM:SS when clear>",
+"effect": "<short phrase, prefix with HH:MM:SS when clear>", "strength": "strong|moderate|weak"}.
+Use EXACTLY these "type" strings:
+  "env->action"     an environment event/state changed MY behavior (phone vibrates -> I pick it up).
+  "env->emotion"    an environment event changed my emotion (loud noise -> startled/annoyed).
+  "emotion->action" my emotion directly drove my behavior (bored -> I start scrolling my phone).
+  "action->env"     my action changed the environment (I flip the switch -> lights turn on);
+                    mirrors env_changes entries with cause "self".
+  "other->action"   another person's action triggered my action (colleague waves me over -> I walk over).
+  "other->env"      another person's action changed the environment (she opens the curtain -> room brightens).
+  "other->emotion"  another person's action changed my emotion (guest laughs -> I relax).
+  "env->env"        an environmental event with NO visible agent causes another environmental
+                    change (云遮住阳光 -> 室内变暗; 风把门吹开).
+Every edge carries a REQUIRED "strength" grading how strongly the cause drove the effect,
+defined counterfactually:
+  strong  = trigger: without this cause the effect likely would NOT have happened, or would have
+            gone a different direction (phone vibrates -> I pick it up; I flip the switch ->
+            lights on).
+  moderate= shaper: the cause changed HOW/WHEN/how vigorously the effect happened, but the effect
+            would still have occurred (boredom speeds up my scrolling; his tone makes me answer
+            more carefully).
+  weak    = background: one contributory factor among several; the effect was mostly driven by
+            habit or task (mild tiredness -> I rub my eyes once).
+Physical edges (action->env, other->env) will almost always be "strong" — that is expected, not
+lazy. Grade honestly; do not pad the graph with weak background edges.
+Rules: the causal direction must be visible or strongly implied by temporal order and mechanism —
+never fabricate; omit an edge only when you doubt it EXISTS (strength "weak" is the honest way to
+record a real but minor influence). 0-3 links is typical; empty array is fine. Quote the atomic
+action / change texts (with their times) from the basic annotation rather than vague summaries.
+
+# Rules
+- Ground everything in THIS clip alone — its footage and its basic annotation; never import
+  knowledge from other clips.
+- LANGUAGE (CRITICAL): detect the dominant language of the basic annotation — look at the
+  language of its self_actions / other_actions / speech texts — and write psychology
+  (emotion keywords + mental_activity) and EVERY causal_links cause/effect string in exactly
+  that language. When you quote an action / change / utterance from the basic annotation,
+  quote it VERBATIM (it is already in that language): never translate it, never mix two
+  languages within one causal edge, and never write mental_activity in a different language
+  than the actions you ground it in.
+- Do NOT translate or duplicate content; output each fact exactly ONCE.
+- Output must be valid JSON: double quotes, no trailing commas, no comments.
+
+============================================================
+# Routing (CRITICAL)
+============================================================
+- The user task message begins with "TASK: BASIC", "TASK: BASELINE", "TASK: CRITIQUE", or
+  "TASK: INFER". Perform ONLY that task; never output the fields of any other task.
+- BASIC: output ONLY the basic fields (environment, people, self_actions, other_actions,
+  env_changes, speech, sound, interface) — never psychology or causal_links.
+- BASELINE: output ONLY the verification_baseline object — no annotation-schema fields.
+- CRITIQUE: the task message carries a verification_baseline and N candidates; output ONLY the
+  critique JSON (baseline_corrections, candidates, best_index, needs_regeneration,
+  regeneration_guidance).
+- INFER: the task message carries a verified BASIC annotation; treat it as ground truth and
+  output ONLY psychology and causal_links.
+- Return ONLY a single JSON object for the named task. No explanations, no markdown code fences,
+  no text outside JSON."""
+
+INFERENCE_USER_TASK_TMPL = (
+    "TASK: INFER — stage 2 inference (psychology + causal_links).\n"
+    "Infer psychology and causal_links for this {duration_desc} first-person video ({clip_id}).\n"
+    "Source file: {src_file}, recorded on {day_label}; the segment starts at approximately {start_hms}.\n"
+    "The clip is downsampled to {fps} fps with its audio track included. The BASIC annotation "
+    "(environment, people, self_actions, other_actions, env_changes, speech, sound, interface) "
+    "follows below — it has been verified against the footage: treat it as ground truth, quote its "
+    "texts and watermark times verbatim in causal edges, and never contradict it or invent objects, "
+    "people, actions or utterances that are not in it.\n"
+    "Watch the clip and the annotation together, then return ONLY the inference JSON object with "
+    "exactly two keys: psychology (emotion + mental_activity) and causal_links (typed, "
+    "strength-graded directed edges).\n"
+    "LANGUAGE (CRITICAL): write psychology.mental_activity and every causal_links cause/effect "
+    "in the SAME language as the basic annotation's own texts (self_actions / other_actions / "
+    "speech): quote those texts VERBATIM (they are already in that language), never translate "
+    "them, and never mix two languages within one edge or between mental_activity and the "
+    "actions it is grounded in.\n\n"
+    "The BASIC annotation follows:\n{basic_json}\n"
+)
+
+
+# ===========================================================================
 # ffmpeg helpers
 # ===========================================================================
 
@@ -586,6 +710,22 @@ def ffprobe_duration(path: Path) -> float:
         text=True,
     )
     return float(out.strip())
+
+
+def ffprobe_fps(path: Path) -> float:
+    """Average frame rate of the first video stream, as a float (0.0 when unreadable)."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            text=True,
+        )
+        num, _, den = out.strip().partition("/")
+        num_f, den_f = float(num), float(den or "1")
+        return num_f / den_f if den_f else 0.0
+    except Exception:
+        return 0.0
 
 
 def ffmpeg_reencode(src: Path, out: Path, *, resolution: int, fps: int, crf: int, audio_k: int) -> None:
@@ -628,7 +768,7 @@ def slice_to_10s(src_video: Path, clip_id: str, out_dir: Path) -> list[Path]:
         subprocess.run([
             "ffmpeg", "-y", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-i", str(src_video), "-t", f"{slice_dur:.3f}",
-            "-vf", "fps=2,scale=1024:1024:flags=lanczos",
+            "-vf", f"fps={DEFAULT_FPS},scale=1024:1024:flags=lanczos",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
             "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-movflags", "+faststart", str(p),
         ], check=True, capture_output=True, text=True)
@@ -703,7 +843,12 @@ def split_source_into_slices(src: Path, clip_id: str, base_hms: str, target_s: i
         is_whole = (n == 1)
         suffix = "" if is_whole else f"_p{i + 1}"
         out_path = out_dir / f"{clip_id}{suffix}.mp4"
+        # Reuse a cached encode only when it matches the TARGET fps — a cache from an
+        # older run (e.g. 2fps) must not be sent as if it were the current fps.
+        cached_ok = False
         if skip_if_exists and out_path.exists() and out_path.stat().st_size > 0:
+            cached_ok = abs(ffprobe_fps(out_path) - fps) <= 0.5
+        if cached_ok:
             pass  # keep existing encode
         else:
             cmd = [
@@ -731,7 +876,7 @@ def split_source_into_slices(src: Path, clip_id: str, base_hms: str, target_s: i
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 
-_ANNOTATION_SCHEMA = {
+_BASIC_SCHEMA = {
     "type": "object",
     "properties": {
         "environment": {"type": "object", "properties": {
@@ -746,20 +891,11 @@ _ANNOTATION_SCHEMA = {
         "speech": {"type": "array", "items": {"type": "object"}},
         "sound": {"type": "array", "items": {"type": "object"}},
         "interface": {"type": "array", "items": {"type": "object"}},
-        "psychology": {
-            "type": "object",
-            "properties": {
-                "emotion": {"type": "string"},
-                "mental_activity": {"type": "string"},
-            },
-            "required": ["emotion"],
-        },
-        # causal_links items are normalized leniently in _norm_causal (invalid/missing
-        # type or strength -> ""), so a stray value on one edge never rejects the whole
-        # response; same closed-set cleanup for env_changes.cause and speech.lang.
-        "causal_links": {"type": "array", "items": {"type": "object"}},
     },
-    "required": ["self_actions", "psychology"],
+    "required": ["self_actions"],
+    # psychology / causal_links are deliberately absent (two-stage pipeline): a response
+    # carrying them (e.g. a legacy full-schema narrative) still validates — the inference
+    # pass owns those layers.
 }
 
 
@@ -778,96 +914,90 @@ _SPEECH_LANGS = ("zh", "en")
 _STRENGTH_LEVELS = ("strong", "moderate", "weak")
 
 
-def parse_json_caption(content: str) -> dict:
-    """Primary parser. Strips code fences, json.loads, validates with jsonschema,
-    normalizes to the canonical shape. Raises ParseFailed on any error."""
-    text = content.strip()
-    if not text:
-        raise ParseFailed("empty content", content)
-    m = _JSON_FENCE_RE.match(text)
-    if m:
-        text = m.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ParseFailed(f"json decode: {e.msg}", content)
-    if not isinstance(data, dict):
-        raise ParseFailed(f"top-level not object (got {type(data).__name__})", content)
+def _norm_action(a):
+    if not isinstance(a, dict):
+        return {"time": "", "time_end": "", "text": str(a)}
+    return {"time": str(a.get("time", "") or ""), "time_end": str(a.get("time_end", "") or ""),
+            "text": str(a.get("text", "") or "")}
+
+
+def _norm_speech(s):
+    if not isinstance(s, dict):
+        return {"lang": "", "speaker": "", "text": str(s)}
+    lang = str(s.get("lang", "") or "").strip().lower()
+    if lang not in _SPEECH_LANGS:
+        lang = ""
+    return {"lang": lang, "speaker": str(s.get("speaker", "") or ""),
+            "text": str(s.get("text", "") or "")}
+
+
+def _norm_person(p):
+    if not isinstance(p, dict):
+        return {"id": "", "descriptor": str(p), "name": "", "note": ""}
+    return {"id": str(p.get("id", "") or ""), "descriptor": str(p.get("descriptor", "") or ""),
+            "name": str(p.get("name", "") or ""), "note": str(p.get("note", "") or "")}
+
+
+def _norm_other(a):
+    if not isinstance(a, dict):
+        return {"time": "", "time_end": "", "person": "", "text": str(a)}
+    return {"time": str(a.get("time", "") or ""), "time_end": str(a.get("time_end", "") or ""),
+            "person": str(a.get("person", "") or ""), "text": str(a.get("text", "") or "")}
+
+
+def _norm_sound(s):
+    if not isinstance(s, dict):
+        return {"time": "", "text": str(s), "source": ""}
+    return {"time": str(s.get("time", "") or ""), "text": str(s.get("text", "") or ""),
+            "source": str(s.get("source", "") or "")}
+
+
+def _norm_interface(o):
+    if not isinstance(o, dict):
+        return {"time": "", "where": "", "app_or_site": "", "content": str(o), "note": ""}
+    return {"time": str(o.get("time", "") or ""), "where": str(o.get("where", "") or ""),
+            "app_or_site": str(o.get("app_or_site", "") or ""),
+            "content": str(o.get("content", "") or o.get("text", "") or ""),
+            "note": str(o.get("note", "") or "")}
+
+
+def _norm_env_change(e):
+    if not isinstance(e, dict):
+        return {"time": "", "time_end": "", "text": str(e), "cause": ""}
+    cause = str(e.get("cause", "") or "").strip().lower()
+    if cause not in _ENV_CAUSES:
+        cause = ""
+    return {"time": str(e.get("time", "") or ""), "time_end": str(e.get("time_end", "") or ""),
+            "text": str(e.get("text", "") or ""), "cause": cause}
+
+
+def _norm_causal(c):
+    if not isinstance(c, dict):
+        return {"type": "", "cause": str(c), "effect": "", "strength": ""}
+    typ = str(c.get("type", "") or "").strip().lower()
+    if typ not in _CAUSAL_TYPES:
+        typ = ""
+    strength = str(c.get("strength", "") or "").strip().lower()
+    if strength not in _STRENGTH_LEVELS:
+        strength = ""
+    return {"type": typ, "cause": str(c.get("cause", "") or ""),
+            "effect": str(c.get("effect", "") or ""), "strength": strength}
+
+
+def parse_basic_caption(content: str) -> dict:
+    """P1 parser: the observable (basic) layers only. Strips code fences, json.loads,
+    validates with jsonschema, normalizes to the canonical shape. psychology / causal_links
+    in the response (e.g. a legacy full-schema narrative) are IGNORED — the inference pass
+    owns those layers. Raises ParseFailed on any error."""
+    data = _loads_json(content)
     if jsonschema is not None:
         try:
-            jsonschema.validate(instance=data, schema=_ANNOTATION_SCHEMA)
+            jsonschema.validate(instance=data, schema=_BASIC_SCHEMA)
         except Exception as e:
             raise ParseFailed(f"schema: {e}", content)
     else:
-        psych = data.get("psychology")
-        if not (isinstance(psych, dict) and psych.get("emotion")):
-            raise ParseFailed("psychology.emotion missing or invalid", content)
         if not isinstance(data.get("self_actions"), list):
             raise ParseFailed("self_actions not array", content)
-
-    def _norm_action(a):
-        if not isinstance(a, dict):
-            return {"time": "", "time_end": "", "text": str(a)}
-        return {"time": str(a.get("time", "") or ""), "time_end": str(a.get("time_end", "") or ""),
-                "text": str(a.get("text", "") or "")}
-
-    def _norm_speech(s):
-        if not isinstance(s, dict):
-            return {"lang": "", "speaker": "", "text": str(s)}
-        lang = str(s.get("lang", "") or "").strip().lower()
-        if lang not in _SPEECH_LANGS:
-            lang = ""
-        return {"lang": lang, "speaker": str(s.get("speaker", "") or ""),
-                "text": str(s.get("text", "") or "")}
-
-    def _norm_person(p):
-        if not isinstance(p, dict):
-            return {"id": "", "descriptor": str(p), "name": "", "note": ""}
-        return {"id": str(p.get("id", "") or ""), "descriptor": str(p.get("descriptor", "") or ""),
-                "name": str(p.get("name", "") or ""), "note": str(p.get("note", "") or "")}
-
-    def _norm_other(a):
-        if not isinstance(a, dict):
-            return {"time": "", "time_end": "", "person": "", "text": str(a)}
-        return {"time": str(a.get("time", "") or ""), "time_end": str(a.get("time_end", "") or ""),
-                "person": str(a.get("person", "") or ""), "text": str(a.get("text", "") or "")}
-
-    def _norm_sound(s):
-        if not isinstance(s, dict):
-            return {"time": "", "text": str(s), "source": ""}
-        return {"time": str(s.get("time", "") or ""), "text": str(s.get("text", "") or ""),
-                "source": str(s.get("source", "") or "")}
-
-    def _norm_interface(o):
-        if not isinstance(o, dict):
-            return {"time": "", "where": "", "app_or_site": "", "content": str(o), "note": ""}
-        return {"time": str(o.get("time", "") or ""), "where": str(o.get("where", "") or ""),
-                "app_or_site": str(o.get("app_or_site", "") or ""),
-                "content": str(o.get("content", "") or o.get("text", "") or ""),
-                "note": str(o.get("note", "") or "")}
-
-    def _norm_env_change(e):
-        if not isinstance(e, dict):
-            return {"time": "", "time_end": "", "text": str(e), "cause": ""}
-        cause = str(e.get("cause", "") or "").strip().lower()
-        if cause not in _ENV_CAUSES:
-            cause = ""
-        return {"time": str(e.get("time", "") or ""), "time_end": str(e.get("time_end", "") or ""),
-                "text": str(e.get("text", "") or ""), "cause": cause}
-
-    def _norm_causal(c):
-        if not isinstance(c, dict):
-            return {"type": "", "cause": str(c), "effect": "", "strength": ""}
-        typ = str(c.get("type", "") or "").strip().lower()
-        if typ not in _CAUSAL_TYPES:
-            typ = ""
-        strength = str(c.get("strength", "") or "").strip().lower()
-        if strength not in _STRENGTH_LEVELS:
-            strength = ""
-        return {"type": typ, "cause": str(c.get("cause", "") or ""),
-                "effect": str(c.get("effect", "") or ""), "strength": strength}
-
-    psych = data.get("psychology") or {}
     env = data.get("environment") or {}
     if isinstance(env, dict):
         environment = {"setting": str(env.get("setting", "") or ""),
@@ -884,6 +1014,19 @@ def parse_json_caption(content: str) -> dict:
         "speech": [_norm_speech(s) for s in data.get("speech", []) or []],
         "sound": [_norm_sound(s) for s in data.get("sound", []) or []],
         "interface": [_norm_interface(o) for o in data.get("interface", []) or []],
+    }
+
+
+def parse_inference_json(content: str) -> dict:
+    """P2 parser: {"psychology": {emotion, mental_activity}, "causal_links": [...]}.
+    causal_links items are normalized leniently (invalid/missing type or strength -> ""),
+    so a stray value on one edge never rejects the whole response. Raises ParseFailed
+    when psychology.emotion is missing or empty."""
+    data = _loads_json(content)
+    psych = data.get("psychology")
+    if not (isinstance(psych, dict) and str(psych.get("emotion", "") or "").strip()):
+        raise ParseFailed("psychology.emotion missing or invalid", content)
+    return {
         "psychology": {"emotion": str(psych.get("emotion", "") or ""),
                        "mental_activity": str(psych.get("mental_activity", "") or "")},
         "causal_links": [_norm_causal(c) for c in data.get("causal_links", []) or []],
@@ -947,6 +1090,8 @@ class CaptionRecord:
     critic: dict = None          # best-of-N critic sub-object: {"enabled", "baseline",
                                  # "candidates", "evaluation", "refined"} or {"skipped":
                                  # "single_valid"} / {"failed": "baseline_failed|critic_failed"}
+    inference: dict = None       # P2 inference sub-object: {"status": "ok"|"failed", "raw",
+                                 # "parsed", "tokens"}; ok -> psychology/causal_links merged in
 
 
 @dataclass
@@ -958,7 +1103,8 @@ class UsageRecord:
     recovery: str                # "ok" | "safety_rejection" | "parse_failed" | "empty" | ...
     usage: dict
     raw_content: str = ""        # captured for non-ok outcomes, for diagnostics
-    stage: str = "generate"      # "generate" (G1) | "refine" (G2) | "baseline" (C1a) | "critic" (C1b/C2b)
+    stage: str = "generate"      # "generate" (G1) | "refine" (G2) | "infer" (P2) |
+                                 # "baseline" (C1a) | "critic" (C1b/C2b)
     call_index: int = -1         # sample slot index for generate/refine calls (0-based); -1 otherwise
 
 
@@ -978,6 +1124,24 @@ class CandidateRecord:
     recovery: str = ""
 
 
+@dataclass
+class CritiqueRecord:
+    """One critic-phase output (C1a baseline / C1b critic / C2b re-critic), persisted to
+    the *_critique.jsonl sidecar: raw model text + parsed JSON + the pool mapping that
+    resolves the critic's candidate indices to sidecar (stage, call_index) slots. Only
+    the winning candidate reaches the main captions file; this sidecar keeps the trail."""
+    clip_id: str
+    global_idx: int
+    phase: str                 # "baseline" (C1a) | "critic" (C1b) | "recritic" (C2b)
+    model: str
+    ts: str
+    tokens: dict
+    latency_s: float
+    raw: str                   # raw model output, kept even when parsing failed
+    parsed: dict = None        # normalized baseline/critic JSON; None on parse failure
+    pool: list = None          # critic phases only: [{stage, call_index}] in pool order
+
+
 # ===========================================================================
 # API helpers
 # ===========================================================================
@@ -986,13 +1150,13 @@ def b64_video(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def _video_content(video_path: Path) -> dict:
+def _video_content(video_path: Path, fps: int = DEFAULT_FPS) -> dict:
     return {"type": "video_url",
-            "video_url": {"url": f"data:video/mp4;base64,{b64_video(video_path)}"}, "fps": 2}
+            "video_url": {"url": f"data:video/mp4;base64,{b64_video(video_path)}"}, "fps": fps}
 
 
-def _meta_kwargs(clip_row: pd.Series, is_10s: bool = False) -> dict:
-    """Shared prompt metadata: clip_id / src_file / day_label / start_hms / duration_desc."""
+def _meta_kwargs(clip_row: pd.Series, is_10s: bool = False, fps: int = DEFAULT_FPS) -> dict:
+    """Shared prompt metadata: clip_id / src_file / day_label / start_hms / duration_desc / fps."""
     src = clip_row["src_file"]
     ts_raw = Path(src).stem.split("_")[-1]
     day_label = f"DAY{int(clip_row['day'])}"
@@ -1003,36 +1167,50 @@ def _meta_kwargs(clip_row: pd.Series, is_10s: bool = False) -> dict:
     # is_10s (recovery slice) overrides to the legacy "10-second" wording for back-compat.
     duration_desc = "10-second" if is_10s else f"~{target_s}-second"
     return dict(clip_id=clip_row["clip_id"], src_file=src, day_label=day_label,
-                start_hms=start_hms, duration_desc=duration_desc)
+                start_hms=start_hms, duration_desc=duration_desc, fps=fps)
 
 
 def make_user_message(video_path: Path, clip_row: pd.Series, is_10s: bool = False,
-                      guidance: str = "") -> dict:
-    """Annotation call message (G1 / G2). `guidance` (G2 regeneration feedback) is
-    appended as an extra paragraph when non-empty."""
-    task = USER_TASK_TMPL.format(**_meta_kwargs(clip_row, is_10s))
+                      guidance: str = "", cfg: ApiCallConfig = None) -> dict:
+    """Basic annotation call message (G1 / G2). `guidance` (G2 regeneration feedback) is
+    appended as an extra paragraph when non-empty. cfg supplies the run fps."""
+    fps = cfg.fps if cfg else DEFAULT_FPS
+    task = USER_TASK_TMPL.format(**_meta_kwargs(clip_row, is_10s, fps))
     if guidance:
         task += (f"\n\nA previous annotation attempt had these problems — avoid them "
                  f"and follow these corrections:\n{guidance}")
-    return {"role": "user", "content": [_video_content(video_path), {"type": "text", "text": task}]}
+    return {"role": "user", "content": [_video_content(video_path, fps), {"type": "text", "text": task}]}
 
 
-def make_baseline_message(video_path: Path, clip_row: pd.Series, is_10s: bool = False) -> dict:
+def make_baseline_message(video_path: Path, clip_row: pd.Series, is_10s: bool = False,
+                          cfg: ApiCallConfig = None) -> dict:
     """C1a watch-only baseline message: video + metadata, NO candidates (anti-anchoring)."""
-    task = CRITIC_BASELINE_USER_TASK_TMPL.format(**_meta_kwargs(clip_row, is_10s))
-    return {"role": "user", "content": [_video_content(video_path), {"type": "text", "text": task}]}
+    fps = cfg.fps if cfg else DEFAULT_FPS
+    task = CRITIC_BASELINE_USER_TASK_TMPL.format(**_meta_kwargs(clip_row, is_10s, fps))
+    return {"role": "user", "content": [_video_content(video_path, fps), {"type": "text", "text": task}]}
 
 
 def make_critic_message(video_path: Path, clip_row: pd.Series, baseline: dict,
-                        candidates: list, is_10s: bool = False) -> dict:
+                        candidates: list, is_10s: bool = False, cfg: ApiCallConfig = None) -> dict:
     """C1b evaluation message: video + baseline + all candidate annotations."""
+    fps = cfg.fps if cfg else DEFAULT_FPS
     cand_block = "\n\n".join(
         f"<<<CANDIDATE {i}>>>\n{json.dumps(c, ensure_ascii=False)}\n<<<END CANDIDATE {i}>>>"
         for i, c in enumerate(candidates))
     task = CRITIC_USER_TASK_TMPL.format(
         n_candidates=len(candidates), baseline=json.dumps(baseline, ensure_ascii=False),
-        candidates_block=cand_block, **_meta_kwargs(clip_row, is_10s))
-    return {"role": "user", "content": [_video_content(video_path), {"type": "text", "text": task}]}
+        candidates_block=cand_block, **_meta_kwargs(clip_row, is_10s, fps))
+    return {"role": "user", "content": [_video_content(video_path, fps), {"type": "text", "text": task}]}
+
+
+def make_inference_message(video_path: Path, clip_row: pd.Series, basic_layers: dict,
+                           is_10s: bool = False, cfg: ApiCallConfig = None) -> dict:
+    """P2 inference message: video + the chosen BASIC annotation (ground-truth context)."""
+    fps = cfg.fps if cfg else DEFAULT_FPS
+    task = INFERENCE_USER_TASK_TMPL.format(
+        basic_json=json.dumps(basic_layers, ensure_ascii=False),
+        **_meta_kwargs(clip_row, is_10s, fps))
+    return {"role": "user", "content": [_video_content(video_path, fps), {"type": "text", "text": task}]}
 
 
 def extract_usage(resp) -> dict:
@@ -1049,7 +1227,8 @@ def extract_usage(resp) -> dict:
 
 
 def build_records_from_response(content, usage, latency, attempt, clip_row, model):
-    """Turn a raw model response into (CaptionRecord | None, UsageRecord).
+    """Turn a raw P1 (basic) model response into (CaptionRecord | None, UsageRecord).
+    psychology / causal_links stay None here — the P2 inference pass fills them.
 
     On any non-ok outcome the raw content is captured in UsageRecord.raw_content.
     recovery field carries the specific outcome label."""
@@ -1062,7 +1241,7 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         return None, UsageRecord(clip_id, gid, attempt, round(latency, 3), outcome, usage, content)
 
     try:
-        layered = parse_json_caption(content)
+        layered = parse_basic_caption(content)
     except ParseFailed:
         return None, UsageRecord(clip_id, gid, attempt, round(latency, 3),
                                  OUTCOME_PARSE_FAILED, usage, content)
@@ -1077,7 +1256,7 @@ def build_records_from_response(content, usage, latency, attempt, clip_row, mode
         people=layered["people"], environment=layered["environment"],
         env_changes=layered["env_changes"], speech=layered["speech"],
         sound=layered["sound"], interface=layered["interface"],
-        psychology=layered["psychology"], causal_links=layered["causal_links"],
+        psychology=layered.get("psychology"), causal_links=layered.get("causal_links"),
         clip_kind=clip_row.get("clip_kind", "30s"), recovery="ok",
     )
     use_rec = UsageRecord(clip_id, gid, attempt, round(latency, 3), outcome, usage)
@@ -1167,8 +1346,7 @@ def parse_critic_json(content: str) -> dict:
         norm_cands.append({
             "index": _to_int(c.get("index")),
             "scores": {k: _to_int(scores.get(k)) for k in
-                       ("faithfulness", "coverage", "timestamp_accuracy",
-                        "rule_compliance", "causal_quality")},
+                       ("faithfulness", "coverage", "timestamp_accuracy", "rule_compliance")},
             "weighted_total": _to_float(c.get("weighted_total")),
             "issues": c.get("issues") if isinstance(c.get("issues"), list) else [],
             "summary": str(c.get("summary", "") or ""),
@@ -1190,12 +1368,12 @@ def parse_critic_json(content: str) -> dict:
 
 
 def _record_layers(cap: CaptionRecord) -> dict:
-    """Canonical annotation dict from a CaptionRecord (critic input shape)."""
+    """Canonical BASIC annotation dict from a CaptionRecord (critic / inference input
+    shape): observable layers only, no psychology / causal_links."""
     return {"environment": cap.environment, "people": cap.people,
             "self_actions": cap.self_actions, "other_actions": cap.other_actions,
             "env_changes": cap.env_changes, "speech": cap.speech, "sound": cap.sound,
-            "interface": cap.interface, "psychology": cap.psychology,
-            "causal_links": cap.causal_links}
+            "interface": cap.interface}
 
 
 def _cap_from_layers(layers: dict, clip_row: pd.Series, model: str, narrative: str,
@@ -1210,8 +1388,8 @@ def _cap_from_layers(layers: dict, clip_row: pd.Series, model: str, narrative: s
         self_actions=layers["self_actions"], other_actions=layers["other_actions"],
         people=layers["people"], environment=layers["environment"],
         env_changes=layers["env_changes"], speech=layers["speech"], sound=layers["sound"],
-        interface=layers["interface"], psychology=layers["psychology"],
-        causal_links=layers["causal_links"], clip_kind=clip_row.get("clip_kind", "30s"),
+        interface=layers["interface"], psychology=layers.get("psychology"),
+        causal_links=layers.get("causal_links"), clip_kind=clip_row.get("clip_kind", "30s"),
         recovery=recovery)
 
 
@@ -1346,11 +1524,12 @@ def count_pieces_for_units(units, log=None) -> list[int]:
 # ===========================================================================
 
 class ApiCallConfig:
-    __slots__ = ("thinking", "json_mode")
+    __slots__ = ("thinking", "json_mode", "fps")
 
-    def __init__(self, thinking, json_mode):
+    def __init__(self, thinking, json_mode, fps=DEFAULT_FPS):
         self.thinking = thinking
         self.json_mode = json_mode
+        self.fps = fps
 
 
 class PreprocessJob:
@@ -1442,25 +1621,29 @@ class ApiJob:
 
 class ApiResult:
     __slots__ = ("global_idx", "clip_id", "caption_records", "usage_records",
-                 "candidate_records", "failures")
+                 "candidate_records", "critique_records", "failures")
 
     def __init__(self, *, global_idx=0, clip_id="", caption_records=None, usage_records=None,
-                 candidate_records=None, failures=None):
+                 candidate_records=None, critique_records=None, failures=None):
         self.global_idx = global_idx
         self.clip_id = clip_id
         self.caption_records = caption_records or []
         self.usage_records = usage_records or []
         self.candidate_records = candidate_records or []
+        self.critique_records = critique_records or []
         self.failures = failures or []
 
 
-def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg):
+def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg, thinking=None):
     """One HTTP call gated by the rate limiter. thinking=enabled omits
-    temperature (Mimo forces its own defaults under deep thinking)."""
+    temperature (Mimo forces its own defaults under deep thinking). `thinking`
+    overrides cfg.thinking for this call (used by the P2 inference pass)."""
     last_exc = None
+    if thinking is None:
+        thinking = cfg.thinking
     kwargs = dict(model=model, messages=messages,
-                  extra_body={"thinking": {"type": cfg.thinking}})
-    if cfg.thinking == "disabled":
+                  extra_body={"thinking": {"type": thinking}})
+    if thinking == "disabled":
         kwargs["temperature"] = 1.0
     if cfg.json_mode:
         kwargs["response_format"] = {"type": "json_object"}
@@ -1480,8 +1663,8 @@ def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg):
 
 def _process_one_clip_limited(client, model, video_path, clip_row, is_10s, log, limiter, cfg,
                               guidance: str = ""):
-    messages = [{"role": "system", "content": SYSTEM_MSG},
-                make_user_message(video_path, clip_row, is_10s=is_10s, guidance=guidance)]
+    messages = [{"role": "system", "content": SHARED_SYSTEM_MSG},
+                make_user_message(video_path, clip_row, is_10s=is_10s, guidance=guidance, cfg=cfg)]
     resp, latency, attempt = _call_api_limited(client, model, messages, log, clip_row["clip_id"], limiter, cfg)
     usage = extract_usage(resp)
     content = resp.choices[0].message.content or ""
@@ -1522,12 +1705,13 @@ def _sample_annotation_call(client, model, video_path, row, is_10s, log, limiter
 
 def _call_baseline(client, model, video_path, row, is_10s, log, limiter, cfg):
     """C1a: watch-only verification-baseline extraction. Retries once on parse failure.
-    Returns (baseline|None, [UsageRecord])."""
+    Returns (baseline|None, [UsageRecord], raw_content_of_last_attempt)."""
     clip_id = row["clip_id"]
     gid = int(row["global_idx"])
-    messages = [{"role": "system", "content": CRITIC_BASELINE_SYSTEM_MSG},
-                make_baseline_message(video_path, row, is_10s=is_10s)]
+    messages = [{"role": "system", "content": SHARED_SYSTEM_MSG},
+                make_baseline_message(video_path, row, is_10s=is_10s, cfg=cfg)]
     last_use = None
+    last_content = ""
     for attempt in range(2):
         try:
             resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter, cfg)
@@ -1536,29 +1720,31 @@ def _call_baseline(client, model, video_path, row, is_10s, log, limiter, cfg):
             if attempt == 0:
                 time.sleep(2.0)
                 continue
-            return None, [last_use] if last_use else []
+            return None, [last_use] if last_use else [], last_content
         usage = extract_usage(resp)
         content = resp.choices[0].message.content or ""
+        last_content = content
         use = UsageRecord(clip_id, gid, at, round(latency, 3), "ok", usage,
                           stage="baseline", call_index=-1)
         last_use = use
         try:
-            return parse_baseline_json(content), [use]
+            return parse_baseline_json(content), [use], content
         except ParseFailed as e:
             use.recovery = OUTCOME_PARSE_FAILED
             use.raw_content = content
             log.warning(f"[{clip_id}] baseline parse failed ({e.reason}); retrying once")
-    return None, [last_use]
+    return None, [last_use], last_content
 
 
 def _call_critic(client, model, video_path, row, is_10s, log, limiter, cfg, baseline, candidates):
     """C1b/C2b: critic evaluation. Retries once on parse failure.
-    Returns (critic_json|None, [UsageRecord])."""
+    Returns (critic_json|None, [UsageRecord], raw_content_of_last_attempt)."""
     clip_id = row["clip_id"]
     gid = int(row["global_idx"])
-    messages = [{"role": "system", "content": CRITIC_SYSTEM_MSG},
-                make_critic_message(video_path, row, baseline, candidates, is_10s=is_10s)]
+    messages = [{"role": "system", "content": SHARED_SYSTEM_MSG},
+                make_critic_message(video_path, row, baseline, candidates, is_10s=is_10s, cfg=cfg)]
     last_use = None
+    last_content = ""
     for attempt in range(2):
         try:
             resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter, cfg)
@@ -1567,19 +1753,86 @@ def _call_critic(client, model, video_path, row, is_10s, log, limiter, cfg, base
             if attempt == 0:
                 time.sleep(2.0)
                 continue
-            return None, [last_use] if last_use else []
+            return None, [last_use] if last_use else [], last_content
         usage = extract_usage(resp)
         content = resp.choices[0].message.content or ""
+        last_content = content
         use = UsageRecord(clip_id, gid, at, round(latency, 3), "ok", usage,
                           stage="critic", call_index=-1)
         last_use = use
         try:
-            return parse_critic_json(content), [use]
+            return parse_critic_json(content), [use], content
         except ParseFailed as e:
             use.recovery = OUTCOME_PARSE_FAILED
             use.raw_content = content
             log.warning(f"[{clip_id}] critic parse failed ({e.reason}); retrying once")
-    return None, [last_use]
+    return None, [last_use], last_content
+
+
+def _critique_from_use(clip_id, gid, phase, model, raw, parsed, pool, use_records):
+    """Build a CritiqueRecord for one critic-phase call; tokens/latency come from the
+    LAST usage record (the attempt that produced `raw`)."""
+    u = use_records[-1] if use_records else None
+    return CritiqueRecord(
+        clip_id=clip_id, global_idx=gid, phase=phase, model=model,
+        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        tokens=(u.usage if u else {}), latency_s=(u.latency_s if u else 0.0),
+        raw=(raw or ""), parsed=parsed, pool=pool)
+
+
+def _call_inference(client, model, video_path, row, is_10s, log, limiter, cfg, basic_layers):
+    """P2: psychology + causal_links inference on top of a chosen BASIC annotation.
+    ALWAYS runs with thinking enabled (INFERENCE_THINKING) — latent-state reasoning
+    benefits from the reasoning chain even when the run's global thinking is off.
+    Two attempts total (API error / parse failure — covers the Mimo first-request
+    rejection, since a refusal lands as a parse failure). Returns
+    (result|None, [UsageRecord], raw_content_of_last_attempt)."""
+    clip_id = row["clip_id"]
+    gid = int(row["global_idx"])
+    messages = [{"role": "system", "content": SHARED_SYSTEM_MSG},
+                make_inference_message(video_path, row, basic_layers, is_10s=is_10s, cfg=cfg)]
+    last_use = None
+    last_content = ""
+    for attempt in range(2):
+        try:
+            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id,
+                                                  limiter, cfg, thinking=INFERENCE_THINKING)
+        except Exception as e:
+            log.warning(f"[{clip_id}] inference API call failed: {type(e).__name__}: {e}")
+            if attempt == 0:
+                time.sleep(2.0)
+                continue
+            return None, [last_use] if last_use else [], last_content
+        usage = extract_usage(resp)
+        content = resp.choices[0].message.content or ""
+        last_content = content
+        use = UsageRecord(clip_id, gid, at, round(latency, 3), "ok", usage,
+                          stage="infer", call_index=-1)
+        last_use = use
+        try:
+            return parse_inference_json(content), [use], content
+        except ParseFailed as e:
+            use.recovery = OUTCOME_PARSE_FAILED
+            use.raw_content = content
+            log.warning(f"[{clip_id}] inference parse failed ({e.reason}); retrying once")
+    return None, [last_use], last_content
+
+
+def _apply_inference(chosen, client, model, slice_path, row, log, limiter, cfg,
+                     usage_records, is_10s=False):
+    """P2: run the inference pass on a finalized BASIC CaptionRecord and merge psychology +
+    causal_links into it; status/raw/parsed land in chosen.inference. Extends usage_records."""
+    infer, use_i, raw_i = _call_inference(client, model, slice_path, row, is_10s, log,
+                                          limiter, cfg, _record_layers(chosen))
+    usage_records.extend(use_i)
+    tokens = use_i[-1].usage if use_i else {}
+    if infer is not None:
+        chosen.psychology = infer["psychology"]
+        chosen.causal_links = infer["causal_links"]
+        chosen.inference = {"status": "ok", "raw": raw_i, "parsed": infer, "tokens": tokens}
+    else:
+        chosen.inference = {"status": "failed", "raw": raw_i, "tokens": tokens}
+        log.warning(f"[{row['clip_id']}] inference failed; keeping basic-only record")
 
 
 def _handle_zero_valid(client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
@@ -1621,6 +1874,8 @@ def _handle_zero_valid(client, model, slice_path, row, log, limiter, cfg, tmp_10
             sub_cap.recovery = "10s_slices"
             sub_cap.best_of_n = 1
             sub_cap.thinking = thinking
+            _apply_inference(sub_cap, client, model, sp, sub_row, log, limiter, cfg,
+                             usage_records, is_10s=True)
             caption_records.append(sub_cap)
             usage_records.append(sub_use)
             ten_s_ok += 1
@@ -1654,9 +1909,9 @@ def _pick_candidate(valid, i, row, model, clip_kind):
 
 
 def _process_clip_legacy(client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir, thinking):
-    """The ORIGINAL single-call per-clip flow (best_of_n=1), behaviourally identical:
-    first-rejection retry, then give-up / 10s-slice fallback. Records are tagged
-    best_of_n=1 so mode-aware resume treats them as single-call output."""
+    """Single-call basic flow (best_of_n=1): one P1 call (with the first-rejection retry,
+    then give-up / 10s-slice fallback) plus one P2 inference call on the surviving record.
+    Records are tagged best_of_n=1 so mode-aware resume treats them as single-call output."""
     clip_id = row["clip_id"]
     gid = int(row["global_idx"])
     caption_records, usage_records, failures = [], [], []
@@ -1689,6 +1944,8 @@ def _process_clip_legacy(client, model, slice_path, row, log, limiter, cfg, tmp_
             usage_records.extend(uses)
             failures.extend(fails)
         else:
+            _apply_inference(cap_rec, client, model, slice_path, row, log, limiter, cfg,
+                             usage_records)
             caption_records.append(cap_rec)
             if use_rec2 is not None:
                 usage_records.append(use_rec2)
@@ -1714,19 +1971,22 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
       C1b  critic evaluation (video + baseline + all candidates) -> best_index
       G2   if the best still fails: refine_samples guided regenerations
       C2b  second critic on {C1b best} ∪ {G2 samples}, reusing the C1a baseline
+      P2   one inference call (psychology + causal_links) on the winning basic annotation
 
     n_valid==0 -> legacy give-up / 10s-slices fallback; n_valid==1 -> keep it, no critic.
-    Returns (caption_records, usage_records, candidate_records, failures)."""
+    Returns (caption_records, usage_records, candidate_records, critique_records, failures);
+    critique_records persist the raw output of every critic-phase call (C1a/C1b/C2b)."""
     clip_id = row["clip_id"]
     gid = int(row["global_idx"])
     clip_kind = row.get("clip_kind", "30s")
-    caption_records, usage_records, candidate_records, failures = [], [], [], []
+    caption_records, usage_records, candidate_records, critique_records, failures = \
+        [], [], [], [], []
 
     # --- Assemble the candidate pool: adopted main record + sidecar candidates + fresh G1 ---
     slots = {}   # call_index -> (cap|None, layers, meta)
     if adopted_record is not None:
         try:
-            layers = parse_json_caption(adopted_record["narrative"])
+            layers = parse_basic_caption(adopted_record["narrative"])
             slots[0] = (None, layers, {"tokens": adopted_record.get("tokens") or {},
                                        "ts_captioned": adopted_record.get("ts_captioned", ""),
                                        "model": adopted_record.get("model", model),
@@ -1740,7 +2000,7 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
             # Stale slot from a run with a larger N; never part of the current pool.
             continue
         try:
-            layers = parse_json_caption(cand.narrative)
+            layers = parse_basic_caption(cand.narrative)
             slots[idx] = (None, layers, {"tokens": cand.tokens, "ts_captioned": cand.ts_captioned,
                                          "model": cand.model, "narrative": cand.narrative,
                                          "recovery": "ok"})
@@ -1777,41 +2037,53 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
         caption_records.extend(caps)
         usage_records.extend(uses)
         failures.extend(fails)
-        return caption_records, usage_records, candidate_records, failures
+        return caption_records, usage_records, candidate_records, critique_records, failures
 
     if n_valid == 1:
         chosen = _pick_candidate(valid, 0, row, model, clip_kind)
         chosen.best_of_n = n_samples
         chosen.thinking = thinking
         chosen.critic = {"enabled": True, "skipped": "single_valid"}
+        _apply_inference(chosen, client, model, slice_path, row, log, limiter, cfg, usage_records)
         caption_records.append(chosen)
         log.info(f"[{clip_id}] only {n_valid} valid candidate; keeping it without critic")
-        return caption_records, usage_records, candidate_records, failures
+        return caption_records, usage_records, candidate_records, critique_records, failures
 
     # --- Two-phase critic: C1a baseline, then C1b evaluation ---
     cand_layers = [layers for _, (_, layers, _) in valid]
-    baseline, use_b = _call_baseline(client, model, slice_path, row, False, log, limiter, cfg)
+    baseline, use_b, raw_b = _call_baseline(client, model, slice_path, row, False, log, limiter, cfg)
     usage_records.extend(use_b)
+    critique_records.append(_critique_from_use(
+        clip_id, gid, "baseline", model, raw_b, baseline, None, use_b))
     if baseline is None:
         chosen = _pick_candidate(valid, 0, row, model, clip_kind)
         chosen.best_of_n = n_samples
         chosen.thinking = thinking
         chosen.critic = {"enabled": True, "failed": "baseline_failed"}
+        _apply_inference(chosen, client, model, slice_path, row, log, limiter, cfg, usage_records)
         caption_records.append(chosen)
         log.warning(f"[{clip_id}] C1a baseline failed; keeping candidate {valid[0][0]} without critic")
-        return caption_records, usage_records, candidate_records, failures
+        return caption_records, usage_records, candidate_records, critique_records, failures
 
-    crit, use_c = _call_critic(client, model, slice_path, row, False, log, limiter, cfg,
-                               baseline, cand_layers)
+    # The critic's candidates[].index refers to this pool order; record the mapping so
+    # the critique sidecar can resolve index -> (stage, call_index) sidecar slot.
+    pool_map = [{"stage": ("adopted" if meta.get("recovery") == "adopted" else "generate"),
+                 "call_index": idx}
+                for idx, (_, _, meta) in valid]
+    crit, use_c, raw_c = _call_critic(client, model, slice_path, row, False, log, limiter, cfg,
+                                      baseline, cand_layers)
     usage_records.extend(use_c)
+    critique_records.append(_critique_from_use(
+        clip_id, gid, "critic", model, raw_c, crit, pool_map, use_c))
     if crit is None:
         chosen = _pick_candidate(valid, 0, row, model, clip_kind)
         chosen.best_of_n = n_samples
         chosen.thinking = thinking
         chosen.critic = {"enabled": True, "failed": "critic_failed"}
+        _apply_inference(chosen, client, model, slice_path, row, log, limiter, cfg, usage_records)
         caption_records.append(chosen)
         log.warning(f"[{clip_id}] C1b critic failed; keeping first valid candidate without critic")
-        return caption_records, usage_records, candidate_records, failures
+        return caption_records, usage_records, candidate_records, critique_records, failures
 
     best_pos = min(max(crit["best_index"], 0), n_valid - 1)
     chosen = _pick_candidate(valid, best_pos, row, model, clip_kind)
@@ -1828,32 +2100,36 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
         if guidance:
             log.info(f"[{clip_id}] best candidate needs regeneration; "
                      f"sampling {refine_samples} guided refinements")
-            new_slots = []
+            new_slots = []   # (loop_idx, cap_rec, layers) — valid refinements only
             for j in range(refine_samples):
                 cap, uses, _ = _sample_annotation_call(
                     client, model, slice_path, row, False, log, limiter, cfg,
                     guidance=guidance, stage="refine", call_index=j)
                 usage_records.extend(uses)
                 if cap is not None:
-                    new_slots.append((cap, _record_layers(cap)))
+                    new_slots.append((j, cap, _record_layers(cap)))
                     candidate_records.append(CandidateRecord(
                         clip_id, gid, j, "refine", cap.narrative, cap.model,
                         cap.ts_captioned, cap.tokens, recovery="ok"))
             if new_slots:
-                pool = [chosen_layers] + [layers for _, layers in new_slots]
-                crit2, use_c2 = _call_critic(client, model, slice_path, row, False, log,
-                                             limiter, cfg, baseline, pool)
+                pool = [chosen_layers] + [layers for _, _, layers in new_slots]
+                pool_map2 = ([{"stage": "critic1_best", "call_index": valid[best_pos][0]}]
+                             + [{"stage": "refine", "call_index": j} for j, _, _ in new_slots])
+                crit2, use_c2, raw_c2 = _call_critic(client, model, slice_path, row, False, log,
+                                                     limiter, cfg, baseline, pool)
                 usage_records.extend(use_c2)
+                critique_records.append(_critique_from_use(
+                    clip_id, gid, "recritic", model, raw_c2, crit2, pool_map2, use_c2))
                 if crit2 is not None:
                     best2 = min(max(crit2["best_index"], 0), len(pool) - 1)
                     if best2 > 0:
-                        cap2, layers2 = new_slots[best2 - 1]
+                        cap2, layers2 = new_slots[best2 - 1][1], new_slots[best2 - 1][2]
                         chosen = _finalize_candidate(
                             cap2, layers2,
                             {"tokens": cap2.tokens, "ts_captioned": cap2.ts_captioned,
                              "model": cap2.model, "narrative": cap2.narrative, "recovery": "ok"},
                             row, model, clip_kind)
-                        final_src = f"refine candidate {best2 - 1}"
+                        final_src = f"refine candidate {new_slots[best2 - 1][0]}"
                     evaluation = crit2
                     refined = True
                     critic_usage_tokens = use_c2[0].usage if use_c2 else critic_usage_tokens
@@ -1863,6 +2139,7 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
             else:
                 log.warning(f"[{clip_id}] no valid refine candidates; keeping C1b best")
 
+    _apply_inference(chosen, client, model, slice_path, row, log, limiter, cfg, usage_records)
     chosen.best_of_n = n_samples
     chosen.thinking = thinking
     chosen.critic = {
@@ -1880,13 +2157,14 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
     }
     caption_records.append(chosen)
     log.info(f"[{clip_id}] best-of-{n_valid} critic chose {final_src} (refined={refined})")
-    return caption_records, usage_records, candidate_records, failures
+    return caption_records, usage_records, candidate_records, critique_records, failures
 
 
 def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, worker_id,
                 best_of_n=1, refine_samples=2, candidate_slots=None, clip_records=None):
     """API worker. best_of_n=1 keeps the legacy single-call flow; best_of_n>=2 runs the
-    best-of-N sampling + two-phase critic workflow per clip. candidate_slots / clip_records
+    best-of-N sampling + two-phase critic workflow per clip. Either way the surviving
+    basic record gets one P2 inference call. candidate_slots / clip_records
     (shared, read-only) enable resuming: existing candidates are reused and legacy
     single-call records are adopted as candidate 0."""
     candidate_slots = candidate_slots or {}
@@ -1898,13 +2176,15 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
             return
         row, slice_path = job.row, job.slice_path
         clip_id, gid = row["clip_id"], int(row["global_idx"])
-        caption_records, usage_records, candidate_records, failures = [], [], [], []
+        caption_records, usage_records, candidate_records, critique_records, failures = \
+            [], [], [], [], []
 
         if not slice_path.exists():
             log.error(f"[{clip_id}] slice not found: {slice_path}")
             failures.append({"clip_id": clip_id, "global_idx": gid, "error": "slice_not_found"})
             out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
-                                usage_records=usage_records, failures=failures))
+                                usage_records=usage_records, critique_records=critique_records,
+                                failures=failures))
             in_q.task_done()
             continue
 
@@ -1920,15 +2200,17 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
                 # upstream; this is a safety net for that invariant).
                 if adopted is not None and _record_matches_mode(adopted, best_of_n, cfg.thinking):
                     adopted = None
-                caption_records, usage_records, candidate_records, failures = _process_clip_best_of_n(
-                    client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
-                    best_of_n, refine_samples, existing, adopted, cfg.thinking)
+                caption_records, usage_records, candidate_records, critique_records, failures = \
+                    _process_clip_best_of_n(
+                        client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
+                        best_of_n, refine_samples, existing, adopted, cfg.thinking)
         except Exception as e:
             log.error(f"[{clip_id}] worker crash: {type(e).__name__}: {e}")
             failures.append({"clip_id": clip_id, "global_idx": gid,
                              "error": f"worker_crash: {type(e).__name__}: {e}"})
         out_q.put(ApiResult(global_idx=gid, clip_id=clip_id, caption_records=caption_records,
                             usage_records=usage_records, candidate_records=candidate_records,
+                            critique_records=critique_records,
                             failures=failures))
         in_q.task_done()
 
@@ -1941,10 +2223,12 @@ class OrderedWriter:
     """Flush results to jsonl in strict global_idx order. API workers finish out
     of order, so we buffer future results in a heap and emit when next_idx arrives."""
 
-    def __init__(self, captions_path, usage_path, candidates_path, log, next_idx=1):
+    def __init__(self, captions_path, usage_path, candidates_path, critique_path, log,
+                 next_idx=1):
         self.captions_path = captions_path
         self.usage_path = usage_path
         self.candidates_path = candidates_path
+        self.critique_path = critique_path
         self.log = log
         self.next_idx = next_idx
         self._heap = []
@@ -1955,6 +2239,8 @@ class OrderedWriter:
         self.use_f = usage_path.open("a", encoding="utf-8")
         self.cand_f = (candidates_path.open("a", encoding="utf-8")
                        if candidates_path is not None else None)
+        self.cri_f = (critique_path.open("a", encoding="utf-8")
+                      if critique_path is not None else None)
 
     def submit(self, result):
         with self._lock:
@@ -1972,6 +2258,9 @@ class OrderedWriter:
             if self.cand_f is not None:
                 for cand in res.candidate_records:
                     self.cand_f.write(json.dumps(asdict(cand), ensure_ascii=False) + "\n")
+            if self.cri_f is not None:
+                for cri in res.critique_records:
+                    self.cri_f.write(json.dumps(asdict(cri), ensure_ascii=False) + "\n")
             self.n_written += 1
             if res.global_idx >= self.next_idx:
                 self.next_idx = res.global_idx + 1
@@ -1993,6 +2282,8 @@ class OrderedWriter:
             self.use_f.close()
             if self.cand_f is not None:
                 self.cand_f.close()
+            if self.cri_f is not None:
+                self.cri_f.close()
 
 
 # ===========================================================================
@@ -2102,11 +2393,14 @@ def load_existing_candidate_slots(candidates_path) -> dict:
 
 def _record_matches_mode(rec: dict, best_of_n: int, thinking: str) -> bool:
     """True when an existing final record satisfies the current run config, i.e. the
-    clip does NOT need reprocessing. best_of_n=1 accepts any record (legacy)."""
+    clip does NOT need reprocessing. best_of_n=1 accepts any record (legacy). Best-of-N
+    additionally requires a successful P2 inference pass, so clips whose inference failed
+    are retried on resume (G1 candidates are reused from the sidecar)."""
     if best_of_n <= 1:
         return True
     return (rec.get("best_of_n") == best_of_n and rec.get("thinking") == thinking
-            and "critic" in rec)
+            and "critic" in rec
+            and (rec.get("inference") or {}).get("status") == "ok")
 
 
 def _clip_done(clip_id: str, gid: int, clip_records: dict, best_of_n: int,
@@ -2148,7 +2442,9 @@ def main():
                     help="output jsonl (default: ./captions/{participant}/DAY{day}/{start}-{end}.jsonl)")
     # --- Encoding ---
     ap.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION)
-    ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    ap.add_argument("--fps", type=int, default=DEFAULT_FPS,
+                    help="encoded frame rate of the slices sent to the model (default 1 — "
+                         "the target deployment environment captures one image per second).")
     ap.add_argument("--crf", type=int, default=DEFAULT_CRF)
     ap.add_argument("--audio-k", type=int, default=DEFAULT_AUDIO_BITRATE_K)
     # --- Model / API ---
@@ -2158,9 +2454,10 @@ def main():
     ap.add_argument("--env-file", type=Path, default=None,
                     help=".env file to load MIMO_API_KEY from (default: search CWD + script dir)")
     ap.add_argument("--thinking", default=THINKING_DEFAULT, choices=["enabled", "disabled"],
-                    help="reasoning mode (default: enabled — causal-graph annotation is "
-                         "reasoning-heavy). Use --thinking disabled "
-                         "for ~4x cheaper/faster runs (causal_links quality drops). "
+                    help="per-call reasoning mode (default: disabled — quality comes from "
+                         "best-of-N sampling + critic selection, and disabled is ~4x "
+                         "cheaper/faster per call). --thinking enabled for deep-reasoning "
+                         "runs (lower --best-of-n to match the cost). "
                          "Under thinking Mimo ignores temperature/top_p.")
     ap.add_argument("--no-json-mode", action="store_true",
                     help="disable response_format=json_object (debug)")
@@ -2182,11 +2479,13 @@ def main():
                     help="confirm --reset when the output already has >10 records (prevents accidental data loss)")
     ap.add_argument("--limit", type=int, default=None, help="only process first N clips (debug)")
     # --- Best-of-N sampling + two-phase critic ---
-    ap.add_argument("--best-of-n", type=int, default=1, metavar="N",
-                    help="sample each clip N times (default 1 = legacy single call, no critic). "
+    ap.add_argument("--best-of-n", type=int, default=6, metavar="N",
+                    help="sample each clip's BASIC annotation N times (default 6). "
                          "N>=2 runs best-of-N: G1 sampling -> two-phase critic "
                          "(watch-only baseline extraction + evaluation) picks the best; "
                          "if even the best fails the threshold, guided regeneration refines it. "
+                         "The winning basic annotation then gets ONE inference call "
+                         "(psychology + causal_links). N=1 = legacy single-call mode. "
                          "Existing candidates in the *_candidates.jsonl sidecar are reused "
                          "on resume; only missing call indices are generated.")
     ap.add_argument("--refine-samples", type=int, default=2, metavar="M",
@@ -2233,6 +2532,9 @@ def main():
     # best-of-N candidate sidecar: one line per (clip_id, call_index) sample, so resume
     # reuses existing calls and only generates the missing indices.
     candidates_path = captions_dir / f"{stem}_candidates.jsonl"
+    # critic-phase sidecar: one line per C1a/C1b/C2b call (raw text + parsed JSON +
+    # pool mapping), so the full scoring trail survives next to the winning candidate.
+    critique_path = captions_dir / f"{stem}_critique.jsonl"
     cache_dir = captions_dir / "_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     slices_dir = cache_dir / "slices"
@@ -2255,7 +2557,7 @@ def main():
             print(f"ERROR: --reset would delete {out_file} which already has {existing} caption records.\n"
                   f"  If you really mean it, add --reset-yes-i-know.", file=sys.stderr)
             sys.exit(2)
-        for p in [out_file, usage_path, summary_path, log_path, candidates_path]:
+        for p in [out_file, usage_path, summary_path, log_path, candidates_path, critique_path]:
             if p.exists():
                 p.unlink()
 
@@ -2274,13 +2576,14 @@ def main():
         sh.setFormatter(fmt); log.addHandler(sh)
 
     json_mode = not args.no_json_mode
-    cfg = ApiCallConfig(args.thinking, json_mode)
+    cfg = ApiCallConfig(args.thinking, json_mode, args.fps)
     log.info(f"participant={args.participant} day={args.day} "
              f"time={args.start_time or '00:00'}-{args.end_time or '23:59'} "
              f"clip_duration={args.clip_duration}s src_root={src_root} "
              f"-> {src_root / args.participant / f'DAY{args.day}'}")
     log.info(f"model={args.model} thinking={args.thinking} json_mode={json_mode} "
-             f"best_of_n={args.best_of_n} refine_samples={args.refine_samples}")
+             f"best_of_n={args.best_of_n} refine_samples={args.refine_samples} fps={args.fps} "
+             f"infer_thinking={INFERENCE_THINKING}")
     log.info(f"output: {out_file}")
 
     # --- Decide clip rows / units ---
@@ -2335,10 +2638,11 @@ def main():
     produced_q: queue.Queue = queue.Queue()
     api_in_q: queue.Queue = queue.Queue(maxsize=args.api_workers * 2)
     result_q: queue.Queue = queue.Queue()
-    writer = OrderedWriter(out_file, usage_path, candidates_path, log, next_idx=resume_idx + 1)
+    writer = OrderedWriter(out_file, usage_path, candidates_path, critique_path, log,
+                           next_idx=resume_idx + 1)
 
     # --- Stats ---
-    all_usage, all_records, all_failures, all_candidates = [], [], [], []
+    all_usage, all_records, all_failures, all_candidates, all_critiques = [], [], [], [], []
     outcome_counts = {OUTCOME_OK: 0, OUTCOME_SAFETY: 0, OUTCOME_PARSE_FAILED: 0,
                       OUTCOME_EMPTY: 0, "10s_slices": 0,
                       "first_attempt_rejection": 0}
@@ -2503,12 +2807,14 @@ def main():
             all_usage.append(use)
             # Outcome buckets count ANNOTATION calls only (G1 generate + G2 refine);
             # baseline/critic calls are tracked via stage counts below.
-            if use.stage in ("generate", "refine"):
+            if use.stage in ("generate", "refine", "infer"):
                 outcome_counts[use.recovery if use.recovery in outcome_counts else OUTCOME_OK] += 1
                 if use.recovery == "":
                     outcome_counts[OUTCOME_OK] += 1
         for cand in res.candidate_records:
             all_candidates.append(cand)
+        for cri in res.critique_records:
+            all_critiques.append(cri)
         for cap in res.caption_records:
             if cap.recovery == "10s_slices":
                 outcome_counts["10s_slices"] += 1
@@ -2544,6 +2850,7 @@ def main():
     # Per-stage call counts (every call carries stage + call_index in the usage file).
     n_generate_calls = sum(1 for u in all_usage if u.stage == "generate")
     n_refine_calls = sum(1 for u in all_usage if u.stage == "refine")
+    n_infer_calls = sum(1 for u in all_usage if u.stage == "infer")
     n_baseline_calls = sum(1 for u in all_usage if u.stage == "baseline")
     n_critic_calls = sum(1 for u in all_usage if u.stage == "critic")
 
@@ -2567,11 +2874,18 @@ def main():
         if cap.recovery == "adopted":
             n_adopted += 1
 
+    # P2 inference outcomes, derived from the final records' inference sub-object.
+    n_infer_ok = sum(1 for c in all_records if isinstance(c.inference, dict)
+                     and c.inference.get("status") == "ok")
+    n_infer_failed = sum(1 for c in all_records if isinstance(c.inference, dict)
+                         and c.inference.get("status") == "failed")
+
     summary = {
         "model": args.model, "participant": args.participant, "day": args.day,
         "time_range": {"start": args.start_time, "end": args.end_time},
-        "clip_duration": args.clip_duration, "thinking": args.thinking, "json_mode": json_mode,
+        "clip_duration": args.clip_duration, "fps": args.fps, "thinking": args.thinking, "json_mode": json_mode,
         "best_of_n": args.best_of_n, "refine_samples": args.refine_samples,
+        "infer_thinking": INFERENCE_THINKING,
         "temperature": (1.0 if args.thinking == "disabled" else None),
         "max_rpm": args.max_rpm, "api_workers": args.api_workers,
         "preprocess_workers": args.preprocess_workers,
@@ -2584,12 +2898,14 @@ def main():
         "n_recovery_10s": outcome_counts["10s_slices"],
         "n_first_attempt_rejection": outcome_counts["first_attempt_rejection"],
         "calls": {"generate": n_generate_calls, "refine": n_refine_calls,
-                  "baseline": n_baseline_calls, "critic": n_critic_calls,
-                  "total": len(all_usage)},
+                  "infer": n_infer_calls, "baseline": n_baseline_calls,
+                  "critic": n_critic_calls, "total": len(all_usage)},
+        "inference": {"ok": n_infer_ok, "failed": n_infer_failed},
         "n_candidates": len(all_candidates),
         "critic": {"ran": n_critic_ran, "skipped_single_valid": n_critic_skipped_single,
                    "critic_failed": n_critic_failed, "baseline_failed": n_baseline_failed,
-                   "refined": n_refined, "adopted_records": n_adopted},
+                   "refined": n_refined, "adopted_records": n_adopted,
+                   "critique_records_persisted": len(all_critiques)},
         "elapsed_s": round(elapsed, 2),
         "effective_rpm": round(results_received / max(elapsed / 60, 1e-9), 2),
         "tokens": {"total_in": total_in, "total_out": total_out, "total_cached": total_cached},
@@ -2612,10 +2928,12 @@ def main():
              f"empty={outcome_counts[OUTCOME_EMPTY]} recovered_10s={outcome_counts['10s_slices']}")
     if args.best_of_n > 1:
         log.info(f"  best_of_n={args.best_of_n}: generate={n_generate_calls} refine={n_refine_calls} "
-                 f"baseline={n_baseline_calls} critic={n_critic_calls} candidates={len(all_candidates)} "
+                 f"infer={n_infer_calls} baseline={n_baseline_calls} critic={n_critic_calls} "
+                 f"candidates={len(all_candidates)} "
                  f"critic_ran={n_critic_ran} single_valid={n_critic_skipped_single} "
                  f"critic_failed={n_critic_failed} baseline_failed={n_baseline_failed} "
                  f"refined={n_refined} adopted={n_adopted}")
+    log.info(f"  inference: ok={n_infer_ok} failed={n_infer_failed} (infer calls={n_infer_calls})")
     log.info(f"  elapsed={elapsed:.1f}s ({elapsed/60:.1f}min)  "
              f"effective_rpm={results_received / max(elapsed / 60, 1e-9):.1f}")
     log.info(f"  tokens: in={total_in} out={total_out} cached={total_cached}")
@@ -2624,6 +2942,7 @@ def main():
     log.info(f"  captions -> {out_file}")
     if args.best_of_n > 1:
         log.info(f"  candidates -> {candidates_path}")
+        log.info(f"  critique  -> {critique_path}")
     log.info(f"  summary  -> {summary_path}")
 
 

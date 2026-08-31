@@ -6,7 +6,7 @@
 >
 > **核心思想**：情绪驱动动作，动作改变环境，环境反过来影响动作与情绪——`causal_links` 显式记录这张**带强度权重**的有向因果图。
 >
-> **默认行为**：每个 ~30s 源视频被切成 3 段 ~10s 片段分别标注（颗粒度更细、首次拒绝率更低）；**thinking 默认开启**（因果推断是推理密集任务）。
+> **默认行为**：每个 ~30s 源视频被切成 3 段 ~10s 片段分别标注（颗粒度更细、首次拒绝率更低）；**thinking 默认关闭**（生成质量改由 best-of-N 采样 + critic 选优保障，关闭推理链每次调用便宜/快 ~4 倍；深度推理跑法用 `--thinking enabled`）。
 > 用 `--clip-duration` 选择切分粒度（5/6/10/15/30）；30 = 不切分（一段源视频一个 caption，旧行为）。
 
 ---
@@ -21,7 +21,7 @@
 |---|---|---|---|
 | **环境（整体）** | `environment` | `{setting, near_field[], background}`：整体场景说明 + **近场物体清单**（我/他人可能交互的东西，模拟器据此 spawn 道具）+ 其余背景一笔。near_field 的物体标签即全片段唯一命名（对象锚定，识别不了就如实描述外观，不猜类别）；场景说明而非变化日志 | ❌（整段） |
 | **人物表** | `people` | 画面中出现的**其他人**花名册（不含自己）：`{id: "P1", descriptor, name, note}`；id 与 descriptor 全片段复用；`name` 仅当场说出/显示才填，不臆造 | ❌ |
-| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤）；走路/转身/坐下/环顾等无宾语动作本身即合法原子动作，不硬凑宾语；只写可观察动作——意图只能进 psychology | ✅ 读视频**左上角两行水印**（第 1 行 `HH:MM:SS:FF`、第 2 行 `DAYn`），标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率）；**右上角是佩戴者 id**（如 A1_JAKE），不作为场景文本转写；视频按 2fps 采样（含音轨），**按水印读时间、严禁数帧推算**，帧间跳变不臆补中间微步 |
+| **自身行为** | `self_actions` | "我"做了什么；第一人称、现在时、动词开头，**原子动作**（一条=一个动词级步骤）；走路/转身/坐下/环顾等无宾语动作本身即合法原子动作，不硬凑宾语；只写可观察动作——意图只能进 psychology | ✅ 读视频**左上角两行水印**（第 1 行 `HH:MM:SS:FF`、第 2 行 `DAYn`），标 `HH:MM:SS-HH:MM:SS` 段（~1-3s 分辨率）；**右上角是佩戴者 id**（如 A1_JAKE），不作为场景文本转写；视频按 1fps 采样（含音轨），**按水印读时间、严禁数帧推算**，帧间跳变不臆补中间微步 |
 | **他人行为** | `other_actions` | 其他人做了什么；同原子化标准，`person` 字段引用 people.id，文本以 descriptor 开头 | ✅ 同一时间轴 |
 | **环境变化** | `env_changes` | 片段内可观察的**原子状态迁移**：物体出现/消失/移动、设备状态改变（屏幕亮/灭、门开、瓶盖拧开）、光线变化、人进出画面；`cause ∈ {self, other, external}` 归因（other 时文中点名人物 id） | ✅ 同一时间轴 |
 | **语音** | `speech` | 关键话语；`lang` + 说话人（`self` 或 people.id，听不清时短描述）+ 引号文本 | ❌（音视不严格对齐，不强求） |
@@ -99,7 +99,13 @@ emotion ──emotion->action──> self_actions ──action->env──> env_c
 ## 2. 安装
 
 ```bash
-pip install openai pandas python-dotenv jsonschema
+# 推荐：uv + 虚拟环境（依赖见 requirements.txt，含 pyarrow——clips.parquet 读写需要）
+uv venv .venv
+uv pip install -r requirements.txt
+.\.venv\Scripts\activate        # Windows；Linux/macOS: source .venv/bin/activate
+
+# 或者直接 pip
+pip install -r requirements.txt
 ```
 
 还需要：
@@ -115,11 +121,11 @@ pip install openai pandas python-dotenv jsonschema
 然后：
 
 ```bash
-# 标注一整天（默认切 10s 片段、JSON 输出、thinking 开启）
+# 标注一整天（默认切 10s 片段、JSON 输出、thinking 关闭）
 python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
 
-# 省成本/提速 ~4 倍（无推理链；动作/环境层照常，causal_links 质量明显下降）
-python caption_pipeline.py --participant A1_JAKE --day 1 --thinking disabled
+# 深度推理跑法（每次调用带推理链，慢/贵 ~3-4 倍；建议配合较低的 --best-of-n）
+python caption_pipeline.py --participant A1_JAKE --day 1 --thinking enabled --best-of-n 2
 
 # 不切分：一段源视频（~30s）一个 caption（旧行为）
 python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
@@ -301,7 +307,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--out` | `./captions/{participant}/DAY{day}/{start}-{end}.jsonl` | 输出文件 |
 | **编码** | | |
 | `--resolution` | `1024` | 重编码分辨率（1024 为水印可读/白板可辨的验证最优点） |
-| `--fps` | `2` | 采样帧率 |
+| `--fps` | `1` | 采样帧率（1 fps 与目标部署环境一致：EgoLife 之外每秒一图） |
 | `--crf` | `28` | 质量 |
 | `--audio-k` | `64` | 音频码率 kbps |
 | **模型** | | |
@@ -309,7 +315,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--base-url` | `https://api.xiaomimimo.com/v1` | |
 | `--api-key-env` | `MIMO_API_KEY` | 环境变量名 |
 | `--env-file` | None | `.env` 文件路径（默认搜索 CWD + 脚本目录） |
-| `--thinking` | `enabled` | 推理模式。默认开——原子分解 + 状态追踪 + 因果推断都是推理密集任务。关掉省 ~4 倍成本/延迟，但 `causal_links` 质量明显下降。thinking 下 Mimo 忽略 temperature |
+| `--thinking` | `disabled` | 推理模式。默认关——生成质量由 best-of-N 采样 + critic 选优保障，关掉推理链每次调用便宜/快 ~4 倍。`enabled` 用于深度推理跑法（建议同时调低 `--best-of-n`）。thinking 下 Mimo 忽略 temperature |
 | `--no-json-mode` | off | 关闭 `response_format=json_object`（debug） |
 | **并发** | | |
 | `--max-rpm` | `90` | 全局 RPM 上限（Mimo 硬限 100，留余量） |
@@ -349,6 +355,19 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
 - **断点续传（模式感知）**：默认开。N=1 时读输出文件跳过已完成（旧行为）；best-of-N 时按
   "最后一条主记录满足当前 `best_of_n` + `thinking` + 含 `critic` 标记"判定完成，sidecar 候选
   复用、只补缺失序号（见 §4 与 §6 的 best-of-N 小节）。切分阶段也跳过已存在 slice。
+
+### 共享系统提示词与前缀缓存（SHARED_SYSTEM_MSG）
+
+四类调用（G1/G2 生成、C1a 基线、C1b/C2b 评审、P2 推理）共用**同一份系统提示词**：公共段
+（角色定位、素材背景、采样与水印规则）只写一遍，四个任务各自的输出 schema 与字段规则作为
+`TASK: BASIC / BASELINE / CRITIQUE / INFER` 四个并列章节收进同一份 prompt，末尾是 Routing
+硬约束（只输出被点名任务的 JSON）；具体执行哪个任务由 user 消息**首行的 `TASK: XXX` 标记**路由。
+
+消息结构固定为 `[system, user(video, text)]` 且 video part 在 text part 之前，因此同一 clip
+的全部调用（N 次采样 + 基线 + 评审 + 可能的 G2/C2b + 推理，约 8~10 次）共享逐字节一致的
+"system + video" 前缀——除该 clip 的首次调用外，视频 token（成本大头）全部命中服务商前缀
+缓存，每次调用只有末尾的任务文本是新的。为此系统提示词里**严禁出现 clip 特定内容**（会破坏
+共享前缀）；命中率可用 `_usage.jsonl` 里的 `cached_tokens` 验证。
 
 ### 错误分类（summary.json 里分项计数）
 
@@ -399,9 +418,9 @@ C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最�
 
 - **60s 合并模式已移除**：实验显示模型处理 60s 视频时只描述前 5-6 秒（三组实验全部如此，非 token 限制）。
   `--clip-duration 60` 和 `concat_two_clips` 已删除。如未来找到让模型"看全"的 prompt 技巧，可考虑重新引入。
-- **thinking 默认开启、成本高**：原子分解 + 因果推断是推理密集任务，默认 `--thinking enabled`，
-  单次延迟/token 约 ×3-4（reasoning 占大头）。省钱跑法：`--thinking disabled`，
-  动作/环境层质量基本不变，`causal_links` 变稀疏且更浅。
+- **thinking 与质量的权衡**：原子分解 + 因果推断是推理密集任务，`--thinking enabled` 时
+  单次延迟/token 约 ×3-4（reasoning 占大头）。默认 `disabled`——生成质量改由 best-of-N
+  采样 + critic 选优保障；需要更深推理时用 `--thinking enabled` 并相应调低 `--best-of-n`。
 - **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，怀疑边存在才省略"，
   且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。`strength` 是模型的主观三档
   判断（反事实定义），聚合时建议按 strong/moderate/weak → 1.0/0.5/0.25 加权，或仅取 strong 边做硬约束。
@@ -410,7 +429,9 @@ C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最�
   `raw_content`，retry 一次通常即恢复）。
 - **单 participant 单 day**：跨天/跨参与者需起多个进程，注意共享 RPM 配额（调低单进程 `--max-rpm`）。
 - **best-of-N 成本高**：每片段约 `N+2` 次调用（低分再 `+M+1`），即 `--best-of-n 4` 约是单次的 6 倍
-  （含 G2 最坏 9 倍）。视频在 C1a 与 C1b 各发一次。省钱：`N=3`、`--refine-samples 0`、C1a 关 thinking（若实测基线质量不受影响）。
+  （含 G2 最坏 9 倍）。视频虽随每次调用发送，但共享系统提示词下 "system + video" 前缀逐字节一致，
+  除首次外均命中前缀缓存（见 §6），边际成本主要是各次不同的任务文本与 completion。
+  省钱：`N=3`、`--refine-samples 0`。
 - **thinking 下候选可能趋同**：MiMo 在 thinking 模式忽略 temperature，N 份 G1 候选可能高度相似，
   选优退化为"选第一份"。可观察候选间编辑距离 / critic 分数方差，必要时 G1 一半样本关 thinking
   （temperature=1.0）换取多样性（详见 `tmp/best_of_n_critic方案计划_v1.md`）。
@@ -425,15 +446,18 @@ C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最�
 
 | 场景 | 推荐参数 |
 |---|---|
-| 标准跑（因果标注质量优先） | 默认即可（`--max-rpm 90`，api-workers 自动 = min(rpm/2, 20) = 20；thinking on, 10s 切分。RPM 用不满 90 属预期，单机不为吃满配额堆连接） |
-| 大批量、预算敏感 | `--thinking disabled --max-rpm 95 --api-workers 8`（放弃推理链，留意 429） |
+| 标准跑（质量/成本平衡） | 默认即可（`--max-rpm 90`，api-workers 自动 = min(rpm/2, 20) = 20；thinking off + best-of-N critic，10s 切分。RPM 用不满 90 属预期，单机不为吃满配额堆连接） |
+| 深度推理（因果标注质量优先） | `--thinking enabled --best-of-n 2`（推理链 ×3-4 成本，用较低 N 对冲） |
+| 大批量、预算敏感 | `--max-rpm 95 --api-workers 8 --best-of-n 1`（单次调用无 critic，留意 429） |
 | best-of-N 幻觉压制 | `--best-of-n 4 --refine-samples 2` | 每片段约 6–9 次调用；建议先 `--limit` 小样本核对 critic 选优与 `verification_baseline` 质量再全量跑 |
 | 调试 prompt | `--limit 3 --api-workers 1`（串行，便于看日志） |
 
-**吞吐估算**：RPM 上限不变（90 RPM ≈ 5400 clip/h 的**调用数**上限），但 thinking 单次延迟 ×3-4、
-completion tokens ×~5-8，单日全量跑的 token 成本显著高于旧默认。DAY1 ~828 段（~30s 源）在
+**吞吐估算**：RPM 上限不变（90 RPM ≈ 5400 clip/h 的**调用数**上限）；thinking 开启时单次延迟 ×3-4、
+completion tokens ×~5-8（默认关闭）。DAY1 ~828 段（~30s 源）在
 `--clip-duration 10` 下 ≈ 2484 片段。切分在 API 等待间隙并行完成，不是瓶颈。
-system prompt 前缀缓存仍有效（实测旧版首次缓存命中 ~73%）。
+共享系统提示词下，同一 clip 的所有调用（生成/基线/评审/推理）命中同一 "system + video"
+前缀缓存（旧版分系统提示词时实测首次缓存命中 ~73%；新版前缀跨全部调用共享，命中率应
+更高，以 `_usage.jsonl` 的 `cached_tokens` 实测为准）。
 
 ---
 
