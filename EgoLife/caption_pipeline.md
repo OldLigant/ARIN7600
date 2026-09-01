@@ -6,14 +6,14 @@
 >
 > **核心思想**：情绪驱动动作，动作改变环境，环境反过来影响动作与情绪——`causal_links` 显式记录这张**带强度权重**的有向因果图。
 >
-> **默认行为**：每个 ~30s 源视频被切成 3 段 ~10s 片段分别标注（颗粒度更细、首次拒绝率更低）；**thinking 默认关闭**（生成质量改由 best-of-N 采样 + critic 选优保障，关闭推理链每次调用便宜/快 ~4 倍；深度推理跑法用 `--thinking enabled`）。
-> 用 `--clip-duration` 选择切分粒度（5/6/10/15/30）；30 = 不切分（一段源视频一个 caption，旧行为）。
+> **默认行为**：每个 ~30s 源视频默认被切成 2 段 ~15s 片段分别标注——帧率降到 1 fps 后，15s 片段每次调用只带 15 帧，仍低于旧 2 fps × 10s 默认的 20 帧，同时 30s 源的调用次数从 3 降到 2；要更细颗粒度/更低首次拒绝率可用 `--clip-duration 10`。**thinking 分阶段默认**——P1 生成关（生成质量由 best-of-N 采样 + critic 选优保障，关推理链每次调用便宜/快 ~4 倍）、critic 与 P2 推理开（评分/潜状态推断是推理密集任务）；可用 `--thinking-p1/--thinking-critic/--thinking-infer` 逐阶段开关，或 `--thinking` 一次覆盖全部。
+> 用 `--clip-duration` 选择切分粒度（5/6/10/15/30）；30 = 不切分（一段源视频一个 caption，旧行为）。P2 推理（psychology/causal_links）可选：`--no-infer` 跳过（只出 BASIC 层）。
 
 ---
 
 ## 1. 它做什么
 
-输入：EgoLife 第一人称视频（参与者戴着 Meta Aria 眼镜录制），默认按 10s 切分。
+输入：EgoLife 第一人称视频（参与者戴着 Meta Aria 眼镜录制），默认按 15s 切分。
 
 输出：一个 JSON 对象，包含 10 个层：
 
@@ -121,17 +121,22 @@ pip install -r requirements.txt
 然后：
 
 ```bash
-# 标注一整天（默认切 10s 片段、JSON 输出、thinking 关闭）
+# 标注一整天（默认切 15s 片段、JSON 输出、thinking 分阶段默认：P1 关 / critic + P2 开）
 python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
 
-# 深度推理跑法（每次调用带推理链，慢/贵 ~3-4 倍；建议配合较低的 --best-of-n）
+# 深度推理跑法（--thinking 一次覆盖全部阶段，每次调用带推理链，慢/贵 ~3-4 倍；
+# 建议配合较低的 --best-of-n）。也可以只开某一阶段，如 --thinking-p1 enabled
 python caption_pipeline.py --participant A1_JAKE --day 1 --thinking enabled --best-of-n 2
+
+# 只出 BASIC 层：跳过 P2 推理（psychology / causal_links 保持 null，
+# 每片段省一次调用；inference 子对象记 status="skipped"）
+python caption_pipeline.py --participant A1_JAKE --day 1 --no-infer
 
 # 不切分：一段源视频（~30s）一个 caption（旧行为）
 python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
 
-# 更细：切 15s（每 30s 源 → 2 段）/ 5s（→ 6 段）
-python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 15
+# 更细：切 10s（每 30s 源 → 3 段，首次拒绝率更低）/ 5s（→ 6 段）
+python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 10
 
 # 只标注某段时间（HHMM）
 python caption_pipeline.py --participant A1_JAKE --day 1 --start-time 1110 --end-time 1130
@@ -267,7 +272,10 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 所有行新增三个可回溯字段（N=1 的旧行没有，按字段存在性判断）：
 
 - `best_of_n`：本次运行每片段采样数（旧单次模式为 1）。
-- `thinking`：本次运行的 thinking 配置（`enabled`/`disabled`）。
+- `thinking`：本次运行的 thinking 配置键（`p1=enabled|disabled,critic=...,infer=...`，分阶段）。
+- `inference`：P2 推理子对象：`{status: "ok"|"failed"|"skipped", raw, parsed, tokens}`。
+  `ok` 时 psychology/causal_links 已合并进主记录；`failed` 保留 basic-only 记录（续传会重试）；
+  `skipped` = `--no-infer` 跳过（未发生调用）。
 - `critic`：critic 子对象（N=1 时为 `null`）：
   - 正常评审后：`{enabled, baseline: {verification_baseline, tokens}, candidates: [{call_index, weighted_total}], evaluation: {baseline_corrections, best_index, needs_regeneration, regeneration_guidance, tokens}, refined}`；
   - 只有 1 份有效候选：`{enabled, skipped: "single_valid"}`（跳过 critic 直接保留）；
@@ -286,9 +294,11 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
   并带 `stage`（generate/refine/baseline/critic）与 `call_index`（生成类调用 0-based 序号，其余为 -1）。
 
 **断点续传语义（best-of-N）**：完成判定是模式感知的——只有"最后一条主记录满足当前
-`best_of_n` + `thinking` + 含 `critic` 标记"才算完成。变更 `--best-of-n` 或 `--thinking`
-会使旧最终记录失效而重跑，但 **sidecar 候选照常复用**（只补缺失序号），旧单次记录会被
-**采纳为候选 0**。N=1 时任何已有记录都算完成（旧行为）。
+`best_of_n` + `thinking` + 含 `critic` 标记 + P2 结果与当前 `--no-infer` 设置一致
+（开推理要求 `inference.status="ok"`，关推理要求 `="skipped"`）"才算完成。变更
+`--best-of-n`、`--thinking`（任一阶段）或 `--no-infer` 都会使旧最终记录失效而重跑，
+但 **sidecar 候选照常复用**（只补缺失序号），旧单次记录会被**采纳为候选 0**。
+N=1 时任何已有记录都算完成（旧行为）。
 
 ---
 
@@ -301,7 +311,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--day` | `1` | 天（1-7） |
 | `--start-time` | None | 起始 HHMM（含），如 `1110` |
 | `--end-time` | None | 结束 HHMM（不含），如 `1130` |
-| `--clip-duration` | `10` | 切分目标秒数，可选 `5`/`6`/`10`/`15`/`30`（须整除 30）。每个源视频切成 `ceil(dur/target)` 段。`30` = 不切分（一段源视频一个 caption，旧行为）。默认 `10`（3 段/源，颗粒度细、首次拒绝率低） |
+| `--clip-duration` | `15` | 切分目标秒数，可选 `5`/`6`/`10`/`15`/`30`（须整除 30）。每个源视频切成 `ceil(dur/target)` 段。`30` = 不切分（一段源视频一个 caption，旧行为）。默认 `15`（2 段/源；1 fps 下每次调用 15 帧，低于旧 2 fps × 10s 默认的 20 帧，且 30s 源少一次调用；要更细颗粒度用 `10`） |
 | **路径** | | |
 | `--src-dir` | `./videos` | 视频树的**根目录**，脚本自动往下找 `{participant}/DAY{day}/` |
 | `--out` | `./captions/{participant}/DAY{day}/{start}-{end}.jsonl` | 输出文件 |
@@ -315,7 +325,11 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--base-url` | `https://api.xiaomimimo.com/v1` | |
 | `--api-key-env` | `MIMO_API_KEY` | 环境变量名 |
 | `--env-file` | None | `.env` 文件路径（默认搜索 CWD + 脚本目录） |
-| `--thinking` | `disabled` | 推理模式。默认关——生成质量由 best-of-N 采样 + critic 选优保障，关掉推理链每次调用便宜/快 ~4 倍。`enabled` 用于深度推理跑法（建议同时调低 `--best-of-n`）。thinking 下 Mimo 忽略 temperature |
+| `--thinking` | None | **全阶段覆盖**：一次设置 P1/critic/P2 三个阶段的 thinking。深度推理跑法用 `--thinking enabled`（建议同时调低 `--best-of-n`）。thinking 下 Mimo 忽略 temperature |
+| `--thinking-p1` | `disabled` | P1 BASIC 生成（G1/G2）的 thinking。默认关——质量由 best-of-N 采样 + critic 选优保障，关推理链每次调用便宜/快 ~4 倍 |
+| `--thinking-critic` | `enabled` | critic 阶段（C1a 基线 + C1b/C2b 评审）的 thinking。默认开——对照视频评分是推理密集任务 |
+| `--thinking-infer` | `enabled` | P2 推理（psychology/causal_links）的 thinking。默认开——潜状态推断受益于推理链 |
+| `--no-infer` | off | 跳过 P2 推理：只出 BASIC 层（psychology/causal_links 为 null），每片段省一次调用；记录 `inference.status="skipped"` |
 | `--no-json-mode` | off | 关闭 `response_format=json_object`（debug） |
 | **并发** | | |
 | `--max-rpm` | `90` | 全局 RPM 上限（Mimo 硬限 100，留余量） |
@@ -327,7 +341,7 @@ ARIN7600/EgoLife/                   <- 脚本所在目录（ROOT）
 | `--reset` | off | 删除输出文件后重跑 |
 | `--limit` | None | 只处理前 N 个 clip（调试） |
 | **best-of-N** | | |
-| `--best-of-n` | `1` | 每片段采样次数。`1` = 旧单次调用（无 critic）。`N≥2` 跑 best-of-N：G1 采样 N 次（每次带 call_index 序号）→ 两阶段 critic（C1a 只看片的基线抽取 + C1b 评审选优）→ best 不达标时带 `regeneration_guidance` 重生成（G2）→ C2b 复用 C1a 基线再评。续传复用 sidecar 候选、只补缺失序号；旧单次主记录采纳为候选 0。critic 需 ≥2 份有效候选；1 份直接保留，0 份走现有失败/10s 兜底 |
+| `--best-of-n` | `6` | 每片段采样次数。`1` = 旧单次调用——孤例无可比对象，**完全不跑 critic/基线**（每片段仅 1 次 P1 + 1 次 P2）。`N≥2` 跑 best-of-N：G1 采样 N 次（每次带 call_index 序号）→ 两阶段 critic（C1a 只看片的基线抽取 + C1b 评审选优）→ best 不达标时带 `regeneration_guidance` 重生成（G2）→ C2b 复用 C1a 基线再评。续传复用 sidecar 候选、只补缺失序号；旧单次主记录采纳为候选 0。critic 需 ≥2 份有效候选；1 份直接保留，0 份走现有失败/10s 兜底 |
 | `--refine-samples` | `2` | G2 重生成采样数（仅 critic 判 `needs_regeneration` 时触发；0 = 关闭重生成） |
 
 ---
@@ -353,8 +367,9 @@ producer-consumer + 全局 RPM 限速器，非阻塞：
   - `--clip-duration < 30`（切分模式，默认）：片段被拒 → retry 一次 → 放弃（已是最小粒度，不再细切）。
   所有 recovery 调用都过同一限速器。
 - **断点续传（模式感知）**：默认开。N=1 时读输出文件跳过已完成（旧行为）；best-of-N 时按
-  "最后一条主记录满足当前 `best_of_n` + `thinking` + 含 `critic` 标记"判定完成，sidecar 候选
-  复用、只补缺失序号（见 §4 与 §6 的 best-of-N 小节）。切分阶段也跳过已存在 slice。
+  "最后一条主记录满足当前 `best_of_n` + `thinking` + 含 `critic` 标记 + P2 结果与
+  `--no-infer` 设置一致"判定完成，sidecar 候选复用、只补缺失序号（见 §4 与 §6 的
+  best-of-N 小节）。切分阶段也跳过已存在 slice。
 
 ### 共享系统提示词与前缀缓存（SHARED_SYSTEM_MSG）
 
@@ -408,9 +423,11 @@ C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最�
 - **两阶段 critic 抗锚定**：C1a 只发视频，critic 先建立独立基线再读候选；
   C1b 把基线当 index（非 closed world），候选里基线没提到的内容需回看片段再判。
 - **断点续传（模式感知）**：完成判定 = 最后一条主记录满足当前 `best_of_n` + `thinking`
-  且含 `critic` 标记；不满足则重跑该 clip，但 sidecar 候选全部复用（只补缺失序号），
-  旧单次记录采纳为候选 0。变更 `--best-of-n`/`--thinking` 即触发这种"复用式重跑"。
-- **成本**：每片段调用数 ≈ `N + 2`（G1 + C1a + C1b），低分触发再 `+ M + 1`（G2 + C2b）。
+  且含 `critic` 标记 + P2 结果与 `--no-infer` 一致；不满足则重跑该 clip，但 sidecar 候选
+  全部复用（只补缺失序号），旧单次记录采纳为候选 0。变更 `--best-of-n`/`--thinking`/
+  `--no-infer` 即触发这种"复用式重跑"。
+- **成本**：每片段调用数 ≈ `N + 2`（G1 + C1a + C1b），低分触发再 `+ M + 1`（G2 + C2b），
+  另加 1 次 P2 推理（`--no-infer` 时省掉）。
 
 ---
 
@@ -418,9 +435,10 @@ C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最�
 
 - **60s 合并模式已移除**：实验显示模型处理 60s 视频时只描述前 5-6 秒（三组实验全部如此，非 token 限制）。
   `--clip-duration 60` 和 `concat_two_clips` 已删除。如未来找到让模型"看全"的 prompt 技巧，可考虑重新引入。
-- **thinking 与质量的权衡**：原子分解 + 因果推断是推理密集任务，`--thinking enabled` 时
-  单次延迟/token 约 ×3-4（reasoning 占大头）。默认 `disabled`——生成质量改由 best-of-N
-  采样 + critic 选优保障；需要更深推理时用 `--thinking enabled` 并相应调低 `--best-of-n`。
+- **thinking 与质量的权衡**：原子分解 + 因果推断是推理密集任务，thinking 开启时
+  单次延迟/token 约 ×3-4（reasoning 占大头）。默认**分阶段**：P1 生成关（质量由 best-of-N
+  采样 + critic 选优保障）、critic 与 P2 推理开；`--thinking enabled` 全开的深度推理跑法
+  建议相应调低 `--best-of-n`。
 - **causal_links 是模型推断**：可能有假阳性/假阴性。prompt 已强制"可见时序 + 合理机制才标，怀疑边存在才省略"，
   且 `cause`/`effect` 要求引用具体动作/变化（带时间），下游可按证据强度过滤。`strength` 是模型的主观三档
   判断（反事实定义），聚合时建议按 strong/moderate/weak → 1.0/0.5/0.25 加权，或仅取 strong 边做硬约束。
@@ -446,15 +464,16 @@ C2b  候选池 = {C1b best} ∪ {G2 样本}，复用 C1a 基线再评，取最�
 
 | 场景 | 推荐参数 |
 |---|---|
-| 标准跑（质量/成本平衡） | 默认即可（`--max-rpm 90`，api-workers 自动 = min(rpm/2, 20) = 20；thinking off + best-of-N critic，10s 切分。RPM 用不满 90 属预期，单机不为吃满配额堆连接） |
+| 标准跑（质量/成本平衡） | 默认即可（`--max-rpm 90`，api-workers 自动 = min(rpm/2, 20) = 20；thinking 分阶段默认 + best-of-N critic，15s 切分。RPM 用不满 90 属预期，单机不为吃满配额堆连接） |
 | 深度推理（因果标注质量优先） | `--thinking enabled --best-of-n 2`（推理链 ×3-4 成本，用较低 N 对冲） |
 | 大批量、预算敏感 | `--max-rpm 95 --api-workers 8 --best-of-n 1`（单次调用无 critic，留意 429） |
+| 只要可观察层（数字孪生先跑通 BASIC） | `--no-infer`（每片段省一次 P2 调用，psychology/causal_links 为 null） |
 | best-of-N 幻觉压制 | `--best-of-n 4 --refine-samples 2` | 每片段约 6–9 次调用；建议先 `--limit` 小样本核对 critic 选优与 `verification_baseline` 质量再全量跑 |
 | 调试 prompt | `--limit 3 --api-workers 1`（串行，便于看日志） |
 
 **吞吐估算**：RPM 上限不变（90 RPM ≈ 5400 clip/h 的**调用数**上限）；thinking 开启时单次延迟 ×3-4、
-completion tokens ×~5-8（默认关闭）。DAY1 ~828 段（~30s 源）在
-`--clip-duration 10` 下 ≈ 2484 片段。切分在 API 等待间隙并行完成，不是瓶颈。
+completion tokens ×~5-8（默认分阶段：P1 关、critic/P2 开）。DAY1 ~828 段（~30s 源）在
+默认 `--clip-duration 15` 下 ≈ 1656 片段（10s 切分则 ≈ 2484）。切分在 API 等待间隙并行完成，不是瓶颈。
 共享系统提示词下，同一 clip 的所有调用（生成/基线/评审/推理）命中同一 "system + video"
 前缀缓存（旧版分系统提示词时实测首次缓存命中 ~73%；新版前缀跨全部调用共享，命中率应
 更高，以 `_usage.jsonl` 的 `cached_tokens` 实测为准）。
@@ -465,7 +484,7 @@ completion tokens ×~5-8（默认关闭）。DAY1 ~828 段（~30s 源）在
 
 基于 DAY4 50 源（148 片段）实测对比 DAY2/3（30s）：
 
-| 指标 | 10s（默认） | 30s（不切分） |
+| 指标 | 10s（旧默认） | 30s（不切分） |
 |---|---|---|
 | 首次拒绝率 | **26.4%** | 52-63.5% |
 | self_actions / 30s 等效 | **~8** | ~4.3 |
@@ -474,10 +493,13 @@ completion tokens ×~5-8（默认关闭）。DAY1 ~828 段（~30s 源）在
 | OCR 命中 | 10.1%（新字段） | 0%（字段不存在） |
 | 缓存命中率（首次） | 73% | 49% |
 
-**结论**：默认 10s 在动作密度和拒绝率上明显占优；30s 在跨片段交互/语音上下文上更全。
-交互密集场景（会议、对话）可考虑 `--clip-duration 30` 或下游聚合相邻 10s caption。
+**结论**：10s 在动作密度和拒绝率上明显占优；30s 在跨片段交互/语音上下文上更全。当前默认
+`15s` 是帧率从 2 fps 降到 1 fps 后的折中——省下的帧预算换成更长片段（每 30s 源少一次调用），
+单次调用帧数（15）仍低于旧 2 fps × 10s 默认（20）。交互密集场景（会议、对话）可考虑
+`--clip-duration 30` 或下游聚合相邻片段 caption。
 
-> 注意：表中数量类指标（self_actions / 30s 等效等）基于**旧版 prompt**（数量建议制、无
-> 原子化要求）实测，仅供切分粒度对比参考；原子化 + causal_links 新版 prompt 下动作数
-> 会系统性偏高（复合行为被拆解），拒绝率也可能随输出变长而变化，待重新实测。
+> 注意：表中数量类指标（self_actions / 30s 等效等）基于**旧版 prompt + 2 fps 编码**实测
+> （数量建议制、无原子化要求），仅供切分粒度对比参考；1 fps 下各档位每次调用的帧数变为
+> 10s=10 帧 / 15s=15 帧 / 30s=30 帧，原子化 + causal_links 新版 prompt 下动作数会系统性
+> 偏高（复合行为被拆解），拒绝率也可能随输出变长而变化，待重新实测。
 > 详见 `captions/_test/DAY4_10s/comparison_report.md`。

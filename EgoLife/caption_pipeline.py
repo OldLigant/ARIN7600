@@ -19,7 +19,8 @@ Two-stage annotation per clip:
   P2 INFER  psychology (emotion / mental_activity) and causal_links, inferred in a
             SINGLE extra call on top of the winning basic annotation — grounded in
             the footage plus that annotation. No critic: these layers are inference,
-            not perception.
+            not perception. OPTIONAL: --no-infer skips this pass entirely (basic-only
+            records; psychology / causal_links stay null).
 
 All four call types (G1/G2 generate, C1a baseline, C1b/C2b critic, P2 inference) share ONE
 system prompt (SHARED_SYSTEM_MSG), routed by a "TASK:" marker on the first line of the user
@@ -27,12 +28,14 @@ message. Every call for the same clip therefore carries the identical "system + 
 and hits the provider's prefix cache — the video tokens are processed (and billed) in full
 only once per clip.
 
-By default each ~30s source file is split into 3 x ~10s pieces and each piece is
-captioned independently (finer granularity, lower per-call rejection rate). Use
---clip-duration to choose a different split target (5/6/10/15/30); 30 disables
-splitting (one caption per source file, the legacy behaviour). Frames are encoded
-at 1 fps by default, matching the target deployment environment (one image per
-second outside the EgoLife dataset).
+By default each ~30s source file is split into 2 x ~15s pieces and each piece is
+captioned independently. The 15s default reflects the 1 fps encode: a 15s piece
+carries 15 frames per call — still fewer than the old 2 fps x 10s default (20
+frames) — while a 30s source needs 2 calls instead of 3. Use --clip-duration to
+choose a different split target (5/6/10/15/30; 10 = finer granularity, lower
+per-call rejection rate); 30 disables splitting (one caption per source file,
+the legacy behaviour). Frames are encoded at 1 fps by default, matching the
+target deployment environment (one image per second outside the EgoLife dataset).
 
 Single file, no sibling-module imports. Depends only on the OpenAI SDK,
 pandas, python-dotenv, jsonschema, and ffmpeg/ffprobe on PATH.
@@ -45,13 +48,18 @@ Architecture
 
 Usage
 -----
-  # standard run: 10s pieces @ 1 fps, thinking OFF, best-of-6 sampling +
-  # two-phase critic on the basic layers, then one inference call per clip
+  # standard run: 15s pieces @ 1 fps, per-stage thinking defaults (P1 OFF, critic + P2 ON),
+  # best-of-6 sampling + two-phase critic, then one inference call per clip
   python caption_pipeline.py --participant A1_JAKE --day 1 --max-rpm 90
-  # single-call mode: one basic call + one inference call per clip, no critic
+  # single-call mode: one basic call + one inference call per clip. N=1 means a lone
+  # sample has nothing to be compared against, so the critic phases never run.
   python caption_pipeline.py --best-of-n 1
-  # deeper per-call reasoning (slower/costlier; lower N to match the cost)
+  # BASIC layers only: skip the P2 inference pass (psychology / causal_links stay null)
+  python caption_pipeline.py --no-infer
+  # per-stage reasoning: --thinking-p1 / --thinking-critic / --thinking-infer each take
+  # enabled|disabled; --thinking overrides ALL three at once (slower/costlier; lower N)
   python caption_pipeline.py --thinking enabled --best-of-n 2
+  python caption_pipeline.py --thinking-p1 enabled --thinking-critic disabled
   # legacy: one caption per 30s source file (no splitting)
   python caption_pipeline.py --participant A1_JAKE --day 1 --clip-duration 30
   # time-windowed
@@ -113,14 +121,18 @@ ROOT = Path(__file__).resolve().parent  # .../ARIN7600/EgoLife/
 # Constants & prompt
 # ===========================================================================
 
-# Generation quality now comes from best-of-N sampling + critic selection, not from
-# per-call thinking; disabled is ~4x cheaper/faster per call. Re-enable explicitly
-# for deep-reasoning single-call runs.
-THINKING_DEFAULT = "disabled"
-
-# P2 (TASK: INFER — psychology + causal_links) is latent-state reasoning, not perception:
-# it ALWAYS runs with thinking enabled regardless of the global --thinking flag.
-INFERENCE_THINKING = "enabled"
+# Per-stage thinking defaults, independently configurable via
+# --thinking-p1 / --thinking-critic / --thinking-infer:
+#   P1 (TASK: BASIC, G1/G2)      — quality comes from best-of-N sampling + critic
+#                                  selection, so generation runs ~4x cheaper/faster
+#                                  with thinking OFF (default).
+#   critic phase (C1a baseline + C1b/C2b evaluation) — scoring against the footage
+#                                  is reasoning-heavy: thinking ON (default).
+#   P2 (TASK: INFER, psychology + causal_links) — latent-state reasoning:
+#                                  thinking ON (default).
+THINKING_P1_DEFAULT = "disabled"
+THINKING_CRITIC_DEFAULT = "enabled"
+THINKING_INFER_DEFAULT = "enabled"
 
 # ffmpeg re-encode defaults. 1 fps matches the target deployment environment, which
 # only captures one image per second outside the EgoLife dataset.
@@ -1090,8 +1102,9 @@ class CaptionRecord:
     critic: dict = None          # best-of-N critic sub-object: {"enabled", "baseline",
                                  # "candidates", "evaluation", "refined"} or {"skipped":
                                  # "single_valid"} / {"failed": "baseline_failed|critic_failed"}
-    inference: dict = None       # P2 inference sub-object: {"status": "ok"|"failed", "raw",
-                                 # "parsed", "tokens"}; ok -> psychology/causal_links merged in
+    inference: dict = None       # P2 inference sub-object: {"status": "ok"|"failed"|"skipped",
+                                 # "raw", "parsed", "tokens"}; ok -> psychology/causal_links
+                                 # merged in; skipped -> P2 disabled via --no-infer (no call)
 
 
 @dataclass
@@ -1524,12 +1537,23 @@ def count_pieces_for_units(units, log=None) -> list[int]:
 # ===========================================================================
 
 class ApiCallConfig:
-    __slots__ = ("thinking", "json_mode", "fps")
+    __slots__ = ("thinking_p1", "thinking_critic", "thinking_infer", "run_infer",
+                 "json_mode", "fps")
 
-    def __init__(self, thinking, json_mode, fps=DEFAULT_FPS):
-        self.thinking = thinking
+    def __init__(self, thinking_p1, thinking_critic, thinking_infer, run_infer=True,
+                 json_mode=True, fps=DEFAULT_FPS):
+        self.thinking_p1 = thinking_p1
+        self.thinking_critic = thinking_critic
+        self.thinking_infer = thinking_infer
+        self.run_infer = run_infer     # False (--no-infer): skip the P2 pass entirely
         self.json_mode = json_mode
         self.fps = fps
+
+    @property
+    def thinking_key(self) -> str:
+        """Canonical resume-matching key for the thinking config of this run."""
+        return (f"p1={self.thinking_p1},critic={self.thinking_critic},"
+                f"infer={self.thinking_infer}")
 
 
 class PreprocessJob:
@@ -1634,13 +1658,13 @@ class ApiResult:
         self.failures = failures or []
 
 
-def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg, thinking=None):
-    """One HTTP call gated by the rate limiter. thinking=enabled omits
-    temperature (Mimo forces its own defaults under deep thinking). `thinking`
-    overrides cfg.thinking for this call (used by the P2 inference pass)."""
+def _call_api_limited(client, model, messages, log, clip_id, limiter, cfg, thinking):
+    """One HTTP call gated by the rate limiter. thinking=enabled omits temperature
+    (Mimo forces its own defaults under deep thinking). `thinking` is the per-stage
+    value for this call: cfg.thinking_p1 (G1/G2), cfg.thinking_critic (C1a/C1b/C2b)
+    or cfg.thinking_infer (P2) — callers pass it explicitly so no stage silently
+    inherits another's setting."""
     last_exc = None
-    if thinking is None:
-        thinking = cfg.thinking
     kwargs = dict(model=model, messages=messages,
                   extra_body={"thinking": {"type": thinking}})
     if thinking == "disabled":
@@ -1665,7 +1689,8 @@ def _process_one_clip_limited(client, model, video_path, clip_row, is_10s, log, 
                               guidance: str = ""):
     messages = [{"role": "system", "content": SHARED_SYSTEM_MSG},
                 make_user_message(video_path, clip_row, is_10s=is_10s, guidance=guidance, cfg=cfg)]
-    resp, latency, attempt = _call_api_limited(client, model, messages, log, clip_row["clip_id"], limiter, cfg)
+    resp, latency, attempt = _call_api_limited(client, model, messages, log,
+                                               clip_row["clip_id"], limiter, cfg, cfg.thinking_p1)
     usage = extract_usage(resp)
     content = resp.choices[0].message.content or ""
     cap_rec, use_rec = build_records_from_response(content, usage, latency, attempt, clip_row, model)
@@ -1714,7 +1739,8 @@ def _call_baseline(client, model, video_path, row, is_10s, log, limiter, cfg):
     last_content = ""
     for attempt in range(2):
         try:
-            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter, cfg)
+            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter,
+                                                  cfg, thinking=cfg.thinking_critic)
         except Exception as e:
             log.warning(f"[{clip_id}] baseline API call failed: {type(e).__name__}: {e}")
             if attempt == 0:
@@ -1737,7 +1763,9 @@ def _call_baseline(client, model, video_path, row, is_10s, log, limiter, cfg):
 
 
 def _call_critic(client, model, video_path, row, is_10s, log, limiter, cfg, baseline, candidates):
-    """C1b/C2b: critic evaluation. Retries once on parse failure.
+    """C1b/C2b: critic evaluation. Retries once on parse failure. Runs with the stage
+    thinking setting (cfg.thinking_critic, default enabled) — scoring candidates against
+    the footage is reasoning-heavy.
     Returns (critic_json|None, [UsageRecord], raw_content_of_last_attempt)."""
     clip_id = row["clip_id"]
     gid = int(row["global_idx"])
@@ -1747,7 +1775,8 @@ def _call_critic(client, model, video_path, row, is_10s, log, limiter, cfg, base
     last_content = ""
     for attempt in range(2):
         try:
-            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter, cfg)
+            resp, latency, at = _call_api_limited(client, model, messages, log, clip_id, limiter,
+                                                  cfg, thinking=cfg.thinking_critic)
         except Exception as e:
             log.warning(f"[{clip_id}] critic API call failed: {type(e).__name__}: {e}")
             if attempt == 0:
@@ -1782,8 +1811,8 @@ def _critique_from_use(clip_id, gid, phase, model, raw, parsed, pool, use_record
 
 def _call_inference(client, model, video_path, row, is_10s, log, limiter, cfg, basic_layers):
     """P2: psychology + causal_links inference on top of a chosen BASIC annotation.
-    ALWAYS runs with thinking enabled (INFERENCE_THINKING) — latent-state reasoning
-    benefits from the reasoning chain even when the run's global thinking is off.
+    Runs with the stage thinking setting (cfg.thinking_infer, default enabled) —
+    latent-state reasoning benefits from the reasoning chain.
     Two attempts total (API error / parse failure — covers the Mimo first-request
     rejection, since a refusal lands as a parse failure). Returns
     (result|None, [UsageRecord], raw_content_of_last_attempt)."""
@@ -1796,7 +1825,7 @@ def _call_inference(client, model, video_path, row, is_10s, log, limiter, cfg, b
     for attempt in range(2):
         try:
             resp, latency, at = _call_api_limited(client, model, messages, log, clip_id,
-                                                  limiter, cfg, thinking=INFERENCE_THINKING)
+                                                  limiter, cfg, thinking=cfg.thinking_infer)
         except Exception as e:
             log.warning(f"[{clip_id}] inference API call failed: {type(e).__name__}: {e}")
             if attempt == 0:
@@ -1821,7 +1850,11 @@ def _call_inference(client, model, video_path, row, is_10s, log, limiter, cfg, b
 def _apply_inference(chosen, client, model, slice_path, row, log, limiter, cfg,
                      usage_records, is_10s=False):
     """P2: run the inference pass on a finalized BASIC CaptionRecord and merge psychology +
-    causal_links into it; status/raw/parsed land in chosen.inference. Extends usage_records."""
+    causal_links into it; status/raw/parsed land in chosen.inference. Extends usage_records.
+    A --no-infer run makes no call and marks the record {"status": "skipped"} instead."""
+    if not cfg.run_infer:
+        chosen.inference = {"status": "skipped"}
+        return
     infer, use_i, raw_i = _call_inference(client, model, slice_path, row, is_10s, log,
                                           limiter, cfg, _record_layers(chosen))
     usage_records.extend(use_i)
@@ -1910,8 +1943,9 @@ def _pick_candidate(valid, i, row, model, clip_kind):
 
 def _process_clip_legacy(client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir, thinking):
     """Single-call basic flow (best_of_n=1): one P1 call (with the first-rejection retry,
-    then give-up / 10s-slice fallback) plus one P2 inference call on the surviving record.
-    Records are tagged best_of_n=1 so mode-aware resume treats them as single-call output."""
+    then give-up / 10s-slice fallback) plus one P2 inference call on the surviving record
+    (skipped under --no-infer). Records are tagged best_of_n=1 so mode-aware resume
+    treats them as single-call output."""
     clip_id = row["clip_id"]
     gid = int(row["global_idx"])
     caption_records, usage_records, failures = [], [], []
@@ -1972,6 +2006,7 @@ def _process_clip_best_of_n(client, model, slice_path, row, log, limiter, cfg, t
       G2   if the best still fails: refine_samples guided regenerations
       C2b  second critic on {C1b best} ∪ {G2 samples}, reusing the C1a baseline
       P2   one inference call (psychology + causal_links) on the winning basic annotation
+           (skipped under --no-infer)
 
     n_valid==0 -> legacy give-up / 10s-slices fallback; n_valid==1 -> keep it, no critic.
     Returns (caption_records, usage_records, candidate_records, critique_records, failures);
@@ -2191,19 +2226,20 @@ def _api_worker(in_q, out_q, client, model, limiter, cfg, tmp_10s_dir, log, work
         try:
             if best_of_n <= 1:
                 caption_records, usage_records, failures = _process_clip_legacy(
-                    client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir, cfg.thinking)
+                    client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir, cfg.thinking_key)
             else:
                 existing = candidate_slots.get(clip_id, {})
                 adopted = clip_records.get(clip_id)
                 # Adopt the existing main record only when it does NOT match the current
                 # run config (a matching record means the clip is complete and was skipped
                 # upstream; this is a safety net for that invariant).
-                if adopted is not None and _record_matches_mode(adopted, best_of_n, cfg.thinking):
+                if adopted is not None and _record_matches_mode(adopted, best_of_n,
+                                                                cfg.thinking_key, cfg.run_infer):
                     adopted = None
                 caption_records, usage_records, candidate_records, critique_records, failures = \
                     _process_clip_best_of_n(
                         client, model, slice_path, row, log, limiter, cfg, tmp_10s_dir,
-                        best_of_n, refine_samples, existing, adopted, cfg.thinking)
+                        best_of_n, refine_samples, existing, adopted, cfg.thinking_key)
         except Exception as e:
             log.error(f"[{clip_id}] worker crash: {type(e).__name__}: {e}")
             failures.append({"clip_id": clip_id, "global_idx": gid,
@@ -2391,29 +2427,34 @@ def load_existing_candidate_slots(candidates_path) -> dict:
     return by_clip
 
 
-def _record_matches_mode(rec: dict, best_of_n: int, thinking: str) -> bool:
+def _record_matches_mode(rec: dict, best_of_n: int, thinking: str, run_infer: bool = True) -> bool:
     """True when an existing final record satisfies the current run config, i.e. the
     clip does NOT need reprocessing. best_of_n=1 accepts any record (legacy). Best-of-N
-    additionally requires a successful P2 inference pass, so clips whose inference failed
-    are retried on resume (G1 candidates are reused from the sidecar)."""
+    additionally requires a matching thinking config and the P2 outcome implied by the
+    current --no-infer setting (inference "ok", or "skipped"), so clips produced under
+    a different mode — or whose inference failed — are retried on resume (G1 candidates
+    are reused from the sidecar)."""
     if best_of_n <= 1:
         return True
-    return (rec.get("best_of_n") == best_of_n and rec.get("thinking") == thinking
-            and "critic" in rec
-            and (rec.get("inference") or {}).get("status") == "ok")
+    if not (rec.get("best_of_n") == best_of_n and rec.get("thinking") == thinking
+            and "critic" in rec):
+        return False
+    wanted_status = "ok" if run_infer else "skipped"
+    return (rec.get("inference") or {}).get("status") == wanted_status
 
 
 def _clip_done(clip_id: str, gid: int, clip_records: dict, best_of_n: int,
-               thinking: str, resume_idx: int) -> bool:
+               thinking: str, run_infer: bool, resume_idx: int) -> bool:
     """Resume completion check: skip clips whose LAST final record matches the current
-    run config (best_of_n + thinking + critic marker). Clips with no matching record —
-    including ones that failed or were finalized under a different config in a previous
-    run — are (re)processed. NOTE: no `gid <= resume_idx` shortcut here on purpose:
-    a record from an older config must NOT be treated as done under the new mode."""
+    run config (best_of_n + thinking + --no-infer + critic marker). Clips with no
+    matching record — including ones that failed or were finalized under a different
+    config in a previous run — are (re)processed. NOTE: no `gid <= resume_idx` shortcut
+    here on purpose: a record from an older config must NOT be treated as done under
+    the new mode."""
     rec = clip_records.get(clip_id)
     if rec is None:
         return False
-    return _record_matches_mode(rec, best_of_n, thinking)
+    return _record_matches_mode(rec, best_of_n, thinking, run_infer)
 
 
 # ===========================================================================
@@ -2430,10 +2471,14 @@ def main():
     ap.add_argument("--day", type=int, default=1)
     ap.add_argument("--start-time", default=None, help="start HHMM inclusive, e.g. 1110")
     ap.add_argument("--end-time", default=None, help="end HHMM exclusive, e.g. 1130")
-    ap.add_argument("--clip-duration", type=int, default=10, choices=[5, 6, 10, 15, 30],
+    ap.add_argument("--clip-duration", type=int, default=15, choices=[5, 6, 10, 15, 30],
                     help="split target in seconds. Each source file is sliced into "
-                         "ceil(dur/target) pieces (e.g. 30s->3x10s). Must divide 30 evenly. "
-                         "30 = no splitting (one caption per source file, legacy behaviour).")
+                         "ceil(dur/target) pieces (e.g. 30s->2x15s). Must divide 30 evenly. "
+                         "30 = no splitting (one caption per source file, legacy behaviour). "
+                         "Default 15: at the 1 fps encode a 15s piece carries 15 frames per "
+                         "call, still under the old 2fps x 10s default (20), and a 30s "
+                         "source needs one call fewer than with 10s pieces; 10 = finer "
+                         "granularity, lower per-call rejection rate.")
     # --- Paths ---
     ap.add_argument("--src-dir", type=Path, default=None,
                     help="ROOT of the video tree (default: ./videos). Clips are read from "
@@ -2453,12 +2498,28 @@ def main():
     ap.add_argument("--api-key-env", default="MIMO_API_KEY")
     ap.add_argument("--env-file", type=Path, default=None,
                     help=".env file to load MIMO_API_KEY from (default: search CWD + script dir)")
-    ap.add_argument("--thinking", default=THINKING_DEFAULT, choices=["enabled", "disabled"],
-                    help="per-call reasoning mode (default: disabled — quality comes from "
-                         "best-of-N sampling + critic selection, and disabled is ~4x "
-                         "cheaper/faster per call). --thinking enabled for deep-reasoning "
-                         "runs (lower --best-of-n to match the cost). "
-                         "Under thinking Mimo ignores temperature/top_p.")
+    ap.add_argument("--thinking", default=None, choices=["enabled", "disabled"],
+                    help="thinking override for ALL stages at once (P1 generation, critic, "
+                         "P2 inference). The per-stage flags below carry their own defaults; "
+                         "this overrides whichever stages it is set for. Under thinking Mimo "
+                         "ignores temperature/top_p.")
+    ap.add_argument("--thinking-p1", default=THINKING_P1_DEFAULT, choices=["enabled", "disabled"],
+                    help="thinking for P1 BASIC generation (G1/G2; default: disabled — "
+                         "quality comes from best-of-N sampling + critic selection, and "
+                         "disabled is ~4x cheaper/faster per call).")
+    ap.add_argument("--thinking-critic", default=THINKING_CRITIC_DEFAULT,
+                    choices=["enabled", "disabled"],
+                    help="thinking for the critic phases C1a baseline + C1b/C2b evaluation "
+                         "(default: enabled — scoring candidates against the footage is "
+                         "reasoning-heavy).")
+    ap.add_argument("--thinking-infer", default=THINKING_INFER_DEFAULT,
+                    choices=["enabled", "disabled"],
+                    help="thinking for the P2 inference pass (default: enabled — latent-state "
+                         "reasoning benefits from the chain).")
+    ap.add_argument("--no-infer", dest="run_infer", action="store_false",
+                    help="skip the P2 inference pass entirely: records keep only the BASIC "
+                         "layers (psychology / causal_links stay null) and the inference "
+                         "sub-object records {\"status\": \"skipped\"}.")
     ap.add_argument("--no-json-mode", action="store_true",
                     help="disable response_format=json_object (debug)")
     # --- Concurrency ---
@@ -2485,9 +2546,10 @@ def main():
                          "(watch-only baseline extraction + evaluation) picks the best; "
                          "if even the best fails the threshold, guided regeneration refines it. "
                          "The winning basic annotation then gets ONE inference call "
-                         "(psychology + causal_links). N=1 = legacy single-call mode. "
-                         "Existing candidates in the *_candidates.jsonl sidecar are reused "
-                         "on resume; only missing call indices are generated.")
+                         "(psychology + causal_links). N=1 = legacy single-call mode: a lone "
+                         "sample has nothing to be compared against, so NO critic/baseline "
+                         "calls run at all. Existing candidates in the *_candidates.jsonl "
+                         "sidecar are reused on resume; only missing indices are generated.")
     ap.add_argument("--refine-samples", type=int, default=2, metavar="M",
                     help="guided regeneration samples (G2) when the critic says the best "
                          "candidate still needs work (default 2, plan-doc value).")
@@ -2576,14 +2638,20 @@ def main():
         sh.setFormatter(fmt); log.addHandler(sh)
 
     json_mode = not args.no_json_mode
-    cfg = ApiCallConfig(args.thinking, json_mode, args.fps)
+    # --thinking overrides all three per-stage settings when given; otherwise each
+    # stage runs with its own flag's default (P1 off, critic + P2 on).
+    thinking_p1 = args.thinking or args.thinking_p1
+    thinking_critic = args.thinking or args.thinking_critic
+    thinking_infer = args.thinking or args.thinking_infer
+    cfg = ApiCallConfig(thinking_p1, thinking_critic, thinking_infer,
+                        run_infer=args.run_infer, json_mode=json_mode, fps=args.fps)
     log.info(f"participant={args.participant} day={args.day} "
              f"time={args.start_time or '00:00'}-{args.end_time or '23:59'} "
              f"clip_duration={args.clip_duration}s src_root={src_root} "
              f"-> {src_root / args.participant / f'DAY{args.day}'}")
-    log.info(f"model={args.model} thinking={args.thinking} json_mode={json_mode} "
+    log.info(f"model={args.model} thinking=[{cfg.thinking_key}] json_mode={json_mode} "
              f"best_of_n={args.best_of_n} refine_samples={args.refine_samples} fps={args.fps} "
-             f"infer_thinking={INFERENCE_THINKING}")
+             f"infer={'on' if args.run_infer else 'OFF (--no-infer)'}")
     log.info(f"output: {out_file}")
 
     # --- Decide clip rows / units ---
@@ -2629,7 +2697,7 @@ def main():
                        if (args.skip_existing and args.best_of_n > 1) else {})
     n_slots = sum(len(v) for v in candidate_slots.values())
     log.info(f"resume: skip_existing={args.skip_existing} mode=(best_of_n={args.best_of_n}, "
-             f"thinking={args.thinking}) final_records={len(clip_records)} "
+             f"{cfg.thinking_key}, infer={args.run_infer}) final_records={len(clip_records)} "
              f"candidate_slots={n_slots} max_gid={resume_idx}")
 
     limiter = SlidingWindowRateLimiter(args.max_rpm)
@@ -2660,7 +2728,8 @@ def main():
         for _, row in rows.iterrows():
             clip_id = row["clip_id"]
             if args.skip_existing and _clip_done(clip_id, int(row["global_idx"]), clip_records,
-                                                 args.best_of_n, args.thinking, resume_idx):
+                                                 args.best_of_n, cfg.thinking_key, args.run_infer,
+                                                 resume_idx):
                 skipped_existing += 1
                 continue
             sp = row["slice_path"]
@@ -2738,7 +2807,8 @@ def main():
             pp_results_for_parquet.append(pres.row)
             clip_id = pres.row["clip_id"]
             if args.skip_existing and _clip_done(clip_id, int(pres.row["global_idx"]), clip_records,
-                                                 args.best_of_n, args.thinking, resume_idx):
+                                                 args.best_of_n, cfg.thinking_key, args.run_infer,
+                                                 resume_idx):
                 skipped_existing += 1
                 continue
             api_in_q.put(ApiJob(row=pres.row, slice_path=pres.slice_path))
@@ -2879,14 +2949,20 @@ def main():
                      and c.inference.get("status") == "ok")
     n_infer_failed = sum(1 for c in all_records if isinstance(c.inference, dict)
                          and c.inference.get("status") == "failed")
+    n_infer_skipped = sum(1 for c in all_records if isinstance(c.inference, dict)
+                          and c.inference.get("status") == "skipped")
 
     summary = {
         "model": args.model, "participant": args.participant, "day": args.day,
         "time_range": {"start": args.start_time, "end": args.end_time},
-        "clip_duration": args.clip_duration, "fps": args.fps, "thinking": args.thinking, "json_mode": json_mode,
+        "clip_duration": args.clip_duration, "fps": args.fps, "json_mode": json_mode,
+        "thinking": {"p1": thinking_p1, "critic": thinking_critic, "infer": thinking_infer,
+                     "key": cfg.thinking_key, "global_override": args.thinking},
+        "run_infer": args.run_infer,
         "best_of_n": args.best_of_n, "refine_samples": args.refine_samples,
-        "infer_thinking": INFERENCE_THINKING,
-        "temperature": (1.0 if args.thinking == "disabled" else None),
+        "temperature": {"p1": (1.0 if thinking_p1 == "disabled" else None),
+                        "critic": (1.0 if thinking_critic == "disabled" else None),
+                        "infer": (1.0 if thinking_infer == "disabled" else None)},
         "max_rpm": args.max_rpm, "api_workers": args.api_workers,
         "preprocess_workers": args.preprocess_workers,
         "skip_preprocess": args.skip_preprocess, "skip_existing": args.skip_existing,
@@ -2900,7 +2976,7 @@ def main():
         "calls": {"generate": n_generate_calls, "refine": n_refine_calls,
                   "infer": n_infer_calls, "baseline": n_baseline_calls,
                   "critic": n_critic_calls, "total": len(all_usage)},
-        "inference": {"ok": n_infer_ok, "failed": n_infer_failed},
+        "inference": {"ok": n_infer_ok, "failed": n_infer_failed, "skipped": n_infer_skipped},
         "n_candidates": len(all_candidates),
         "critic": {"ran": n_critic_ran, "skipped_single_valid": n_critic_skipped_single,
                    "critic_failed": n_critic_failed, "baseline_failed": n_baseline_failed,
@@ -2933,7 +3009,8 @@ def main():
                  f"critic_ran={n_critic_ran} single_valid={n_critic_skipped_single} "
                  f"critic_failed={n_critic_failed} baseline_failed={n_baseline_failed} "
                  f"refined={n_refined} adopted={n_adopted}")
-    log.info(f"  inference: ok={n_infer_ok} failed={n_infer_failed} (infer calls={n_infer_calls})")
+    log.info(f"  inference: ok={n_infer_ok} failed={n_infer_failed} skipped={n_infer_skipped} "
+             f"(infer calls={n_infer_calls})")
     log.info(f"  elapsed={elapsed:.1f}s ({elapsed/60:.1f}min)  "
              f"effective_rpm={results_received / max(elapsed / 60, 1e-9):.1f}")
     log.info(f"  tokens: in={total_in} out={total_out} cached={total_cached}")
