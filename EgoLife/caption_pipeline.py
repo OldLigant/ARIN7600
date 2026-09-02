@@ -1978,13 +1978,17 @@ def _process_clip_legacy(client, model, slice_path, row, log, limiter, cfg, tmp_
             usage_records.extend(uses)
             failures.extend(fails)
         else:
-            _apply_inference(cap_rec, client, model, slice_path, row, log, limiter, cfg,
-                             usage_records)
-            caption_records.append(cap_rec)
+            # G1 usage bookkeeping must happen BEFORE the inference pass appends
+            # its own records: the previous post-inference `elif not usage_records`
+            # never fired on clean successes, silently dropping every first-try
+            # G1 UsageRecord (and its tokens) from the usage sidecar.
             if use_rec2 is not None:
                 usage_records.append(use_rec2)
             elif not usage_records:
                 usage_records.append(use_rec)
+            _apply_inference(cap_rec, client, model, slice_path, row, log, limiter, cfg,
+                             usage_records)
+            caption_records.append(cap_rec)
         for c in caption_records:
             c.best_of_n = 1
             c.thinking = thinking
@@ -2309,6 +2313,12 @@ class OrderedWriter:
                 self.log.debug(f"[writer] wrote gid={res.global_idx} caps={ids} failures={res.failures}")
             else:
                 self.log.debug(f"[writer] wrote gid={res.global_idx} caps={ids}")
+        # Periodic flush: buffered writes otherwise lag the disk by up to 8KB and
+        # the output files look dead during long runs even while records stream in.
+        if self.n_written and self.n_written % 50 == 0:
+            for f in (self.cap_f, self.use_f, self.cand_f, self.cri_f):
+                if f is not None:
+                    f.flush()
 
     def close(self):
         with self._lock:
@@ -2720,11 +2730,11 @@ def main():
     # --- Preprocess pool (or skip) ---
     pp_job_q: queue.Queue = queue.Queue()
     pp_threads = []
+    api_jobs = []   # skip_preprocess: fed into api_in_q only AFTER workers exist
     if args.skip_preprocess:
         rows = clips_df
         if args.limit:
             rows = rows.head(args.limit)
-        fed = 0
         for _, row in rows.iterrows():
             clip_id = row["clip_id"]
             if args.skip_existing and _clip_done(clip_id, int(row["global_idx"]), clip_records,
@@ -2733,12 +2743,8 @@ def main():
                 skipped_existing += 1
                 continue
             sp = row["slice_path"]
-            api_in_q.put(ApiJob(row=row, slice_path=(cache_dir / sp) if not Path(sp).is_absolute() else Path(sp)))
-            fed += 1
-        expected_total = fed
-        api_fed = fed
-        for _ in range(args.api_workers):
-            api_in_q.put(None)
+            api_jobs.append(ApiJob(row=row, slice_path=(cache_dir / sp) if not Path(sp).is_absolute() else Path(sp)))
+        expected_total = len(api_jobs)
         pp_done, pp_expected = True, 0
     else:
         for w in range(args.preprocess_workers):
@@ -2765,7 +2771,7 @@ def main():
                                        slices_dir=slices_dir, out_dir=cache_dir))
         for _ in range(args.preprocess_workers):
             pp_job_q.put(None)
-        pp_done, pp_expected, api_fed = False, expected_total, 0
+        pp_done, pp_expected = False, expected_total
 
     # --- Progress bar ---
     pbar = None
@@ -2787,35 +2793,46 @@ def main():
         t.start()
         api_threads.append(t)
 
+    # Feed the API queue only AFTER the workers exist: api_in_q is bounded
+    # (2*workers), and putting into it without live consumers deadlocks the main
+    # thread. Workers idle-wait on get(), so this drain is effectively instant.
+    api_fed = 0
+    for job in api_jobs:
+        api_in_q.put(job)
+        api_fed += 1
+
     # --- Bridge & main loop ---
     pp_results_for_parquet = []
     pp_received = 0
     results_received = 0
 
-    def bridge_produced():
-        nonlocal pp_received, pp_done, api_fed, skipped_existing
-        drained = 0
-        while True:
-            try:
-                pres = produced_q.get_nowait()
-            except queue.Empty:
-                break
-            drained += 1
-            if pres.row is None:
-                all_failures.append({"clip_id": pres.clip_id, "global_idx": pres.global_idx, "error": pres.error})
-                continue
-            pp_results_for_parquet.append(pres.row)
-            clip_id = pres.row["clip_id"]
-            if args.skip_existing and _clip_done(clip_id, int(pres.row["global_idx"]), clip_records,
-                                                 args.best_of_n, cfg.thinking_key, args.run_infer,
-                                                 resume_idx):
-                skipped_existing += 1
-                continue
-            api_in_q.put(ApiJob(row=pres.row, slice_path=pres.slice_path))
-            api_fed += 1
-        pp_received += drained
-        if not args.skip_preprocess and pp_received >= pp_expected:
+    if not args.skip_preprocess:
+        def bridge_loop():
+            # Feeds preprocessed slices into api_in_q on a dedicated thread.
+            # api_in_q is bounded and saturates (2*workers) within minutes of a
+            # large run, so this put blocks for long stretches — it must NEVER
+            # run on the main thread: the tqdm bar only advances while the main
+            # loop drains result_q, and a main-thread feeder therefore freezes
+            # the bar until produced_q is fully drained (near the end of the run).
+            nonlocal pp_received, pp_done, api_fed
+            while pp_received < pp_expected:
+                pres = produced_q.get()
+                pp_received += 1
+                if pres.row is None:
+                    all_failures.append({"clip_id": pres.clip_id, "global_idx": pres.global_idx,
+                                         "error": pres.error})
+                    continue
+                pp_results_for_parquet.append(pres.row)
+                clip_id = pres.row["clip_id"]
+                if args.skip_existing and _clip_done(clip_id, int(pres.row["global_idx"]), clip_records,
+                                                     args.best_of_n, cfg.thinking_key, args.run_infer,
+                                                     resume_idx):
+                    skipped_existing += 1
+                    continue
+                api_in_q.put(ApiJob(row=pres.row, slice_path=pres.slice_path))
+                api_fed += 1
             pp_done = True
+        threading.Thread(target=bridge_loop, name="bridge", daemon=True).start()
 
     # Progress feedback: tqdm bar updates per finished clip. If tqdm is not
     # installed we fall back to the old 60-second heartbeat log line.
@@ -2840,28 +2857,35 @@ def main():
         pbar.update(1)
 
     while True:
-        if not args.skip_preprocess:
-            bridge_produced()
-            if pbar is not None and pp_done and not pbar_total_adjusted:
-                # Preprocessing revealed how many clips were skipped-existing;
-                # shrink the bar so it actually reaches 100%.
-                if api_fed != pbar.total:
-                    pbar.total = max(api_fed, pbar.n)
-                    pbar.refresh()
-                pbar_total_adjusted = True
+        if pbar is not None and pp_done and not pbar_total_adjusted:
+            # The skip filter / preprocess count revealed the true fed total;
+            # shrink the bar so it actually reaches 100%.
+            if api_fed != pbar.total:
+                pbar.total = max(api_fed, pbar.n)
+                pbar.refresh()
+            pbar_total_adjusted = True
         now = time.time()
-        if pbar is None and now - last_progress_t >= PROGRESS_INTERVAL_S and expected_total > 0:
+        if expected_total > 0 and now - last_progress_t >= (PROGRESS_INTERVAL_S if pbar is None else 300.0):
             elapsed = now - t_start
             rate = results_received / max(elapsed / 60, 1e-9)
             eta_min = (expected_total - results_received) / rate if rate > 0 else float("inf")
-            if args.skip_preprocess:
-                log.info(f"[progress] api={results_received}/{expected_total} "
-                         f"ok={len(all_records)} failed={len(all_failures)} "
-                         f"elapsed={elapsed/60:.1f}min rpm={rate:.1f} eta={eta_min:.1f}min")
+            if pbar is None:
+                if args.skip_preprocess:
+                    log.info(f"[progress] api={results_received}/{expected_total} "
+                             f"ok={len(all_records)} failed={len(all_failures)} "
+                             f"elapsed={elapsed/60:.1f}min rpm={rate:.1f} eta={eta_min:.1f}min")
+                else:
+                    log.info(f"[progress] preprocess={pp_received}/{pp_expected} "
+                             f"api={results_received}/{api_fed} "
+                             f"ok={len(all_records)} failed={len(all_failures)} "
+                             f"elapsed={elapsed/60:.1f}min rpm={rate:.1f} eta={eta_min:.1f}min")
             else:
-                log.info(f"[progress] preprocess={pp_received}/{pp_expected} "
-                         f"api={results_received}/{api_fed} "
+                # Liveness heartbeat: queue depths make feeder starvation or API
+                # stalls visible even while the bar is rendering.
+                log.info(f"[progress] api={results_received}/{api_fed} "
                          f"ok={len(all_records)} failed={len(all_failures)} "
+                         f"q: produced={produced_q.qsize()} api_in={api_in_q.qsize()} "
+                         f"result={result_q.qsize()} "
                          f"elapsed={elapsed/60:.1f}min rpm={rate:.1f} eta={eta_min:.1f}min")
             last_progress_t = now
         try:
