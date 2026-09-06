@@ -448,7 +448,7 @@ IMPORTANT RULES:
 8. PRIVACY MASKING. Replace ALL personally identifiable or sensitive information with anonymized placeholders:
    - Real names / usernames / account names → "User X", "User Y", etc.
    - School names / university names → "School X", "University X"
-   - Email addresses → "email_x@example.com"
+   - Email addresses → "[email_x@example.com](mailto:email_x@example.com)"
    - Phone numbers → "XXX-XXXX-XXXX"
    - Home addresses → "Address X"
    - API keys / access tokens / passwords / secrets / credentials → replace the entire sensitive value with "X"
@@ -470,6 +470,65 @@ IMPORTANT RULES:
 
 11. GAZE TRACKING. The green circle on each frame shows my exact gaze position. Use this to determine what I am actually looking at vs. what is merely visible in the periphery.
 
+## VERBATIM SPEECH — hard requirement
+Whenever I speak, the `action` field MUST carry my words **verbatim, character for character**,
+inside quotes. Not paraphrased, not summarised, not truncated, not translated, not cleaned up.
+- Keep the original language exactly as spoken (Chinese stays Chinese, English stays English,
+  code-switching stays mixed).
+- Keep filler, repetition, stutters and self-corrections as spoken ("就是先帮我输入一个默认的
+  默认的一个值" keeps both 默认的).
+- Never replace any part of an utterance with "..." or "等等" or a description of what I said.
+  "I explain the requirements" is WRONG. `I say '<exact words>'` is the only acceptable form.
+- The same verbatim quote also goes in the `speech` field. Both fields carry it in full.
+- This applies to `action_brief` too: if the segment is a speech act, the quote survives
+  compression intact — drop the surrounding scaffolding, never the words themselves.
+
+## action_brief — Condensed Action
+Every segment MUST also carry an `action_brief`: `action` with the dead weight removed.
+
+THE RULE — one verb, but keep everything that carries information:
+- Exactly ONE main verb. When `action` chains verbs with "and"/"while"/"then", keep the single
+  most informative one and drop the others. ("bring ... and set" → "place"; "type ... and send"
+  → "send"; "rest my hand while watching" → "monitor".)
+- KEEP every information-bearing element, however long that makes it:
+  * quoted speech or message text — verbatim, character for character, never paraphrased,
+    truncated or elided; see the VERBATIM SPEECH rule above
+  * who it is addressed to / who is speaking
+  * the specific topic, title, or subject matter
+  * app / site / brand names, and the specific object being acted on
+- DROP only what carries no information:
+  device names ("on my MacBook"), body parts and manner ("with my right hand", "using the
+  on-screen keyboard"), posture and location filler ("while sitting at my desk"), screen
+  scaffolding ("on the screen", "in the input box"), and any verb already implied by another.
+- This is compression, never invention or summarisation. Do not replace a specific noun with a
+  generic one — "the Claude Code explanation about TanhTransformedDistribution" must NOT become
+  "explanations". No fixed word budget: as short as possible, but not one bit of signal shorter.
+
+CALIBRATION — these four are the standard:
+- action: "I read the Claude Code panel explanation about TanhTransformedDistribution and
+  change-of-variables log probability calculation."
+  action_brief: "I read the Claude Code explanation about TanhTransformedDistribution and
+  change-of-variables log probability."
+  ← keep the topic; it is the whole point of the segment. Only "panel" and the trailing
+    "calculation" go.
+- action: "I bring a clear glass bottle to the countertop water dispenser beside the sink and
+  set it on the dispenser tray."
+  action_brief: "I place a glass bottle."
+  ← two verbs → one; the dispenser/sink/tray are scenery, the bottle is the object.
+- action: "I type '感觉ai好慢' into the WeChat chat with 'babe' using the on-screen keyboard and
+  send it."
+  action_brief: "I send '感觉ai好慢' to babe."
+  ← keep BOTH the message text and the recipient; drop the keyboard and the app chrome.
+- action: "I rest my hand on top of the water dispenser while watching the glass bottle fill
+  with water."
+  action_brief: "I monitor the water filling."
+  ← the hand is incidental; the watching is the action.
+
+BAD (over-compression — loses signal):
+- "I read Claude explanations."            ← topic destroyed
+- "I send a WeChat message."               ← message text and recipient destroyed
+- "I interact with the interface."         ← everything destroyed
+
 ## Output Format
 Return a JSON object:
 {
@@ -478,6 +537,7 @@ Return a JSON object:
     {
       "time_range": "HH:MM:SS–HH:MM:SS",
       "action": "I grab a coke from the fridge.",
+      "action_brief": "I grab a coke.",
       "objects": ["specific objects I interact with or look at"],
       "environment": "FIRST segment: full establishing world state per Rule 4 (physical space, every visible object with state and position, complete screen content of every display, world text/signage, media playing, ambient audio). LATER segments: ONLY what changed since the previous segment, ignoring changes caused merely by head movement; 'No change.' is valid.",
       "text_visible": ["meaningful readable text near gaze point — skip trivial keyboard/packaging labels"],
@@ -590,7 +650,7 @@ IMPORTANT RULES:
 8. PRIVACY MASKING. Replace ALL personally identifiable or sensitive information with anonymized placeholders:
    - Real names / usernames / account names → "User X", "User Y", etc.
    - School names / university names → "School X", "University X"
-   - Email addresses → "email_x@example.com"
+   - Email addresses → "[email_x@example.com](mailto:email_x@example.com)"
    - Phone numbers → "XXX-XXXX-XXXX"
    - Home addresses → "Address X"
    - API keys / access tokens / passwords / secrets / credentials → replace the entire sensitive value with "X"
@@ -612,6 +672,65 @@ IMPORTANT RULES:
 
 11. ATTENTION WITHOUT GAZE. This recording has no eye tracking, so there is no gaze marker on the frames. Infer what I am attending to from frame composition and continuity — what stays centred, what my hands are on, what persists across consecutive frames — and do not claim to know my exact gaze point.
 
+## VERBATIM SPEECH — hard requirement
+Whenever I speak, the `action` field MUST carry my words **verbatim, character for character**,
+inside quotes. Not paraphrased, not summarised, not truncated, not translated, not cleaned up.
+- Keep the original language exactly as spoken (Chinese stays Chinese, English stays English,
+  code-switching stays mixed).
+- Keep filler, repetition, stutters and self-corrections as spoken ("就是先帮我输入一个默认的
+  默认的一个值" keeps both 默认的).
+- Never replace any part of an utterance with "..." or "等等" or a description of what I said.
+  "I explain the requirements" is WRONG. `I say '<exact words>'` is the only acceptable form.
+- The same verbatim quote also goes in the `speech` field. Both fields carry it in full.
+- This applies to `action_brief` too: if the segment is a speech act, the quote survives
+  compression intact — drop the surrounding scaffolding, never the words themselves.
+
+## action_brief — Condensed Action
+Every segment MUST also carry an `action_brief`: `action` with the dead weight removed.
+
+THE RULE — one verb, but keep everything that carries information:
+- Exactly ONE main verb. When `action` chains verbs with "and"/"while"/"then", keep the single
+  most informative one and drop the others. ("bring ... and set" → "place"; "type ... and send"
+  → "send"; "rest my hand while watching" → "monitor".)
+- KEEP every information-bearing element, however long that makes it:
+  * quoted speech or message text — verbatim, character for character, never paraphrased,
+    truncated or elided; see the VERBATIM SPEECH rule above
+  * who it is addressed to / who is speaking
+  * the specific topic, title, or subject matter
+  * app / site / brand names, and the specific object being acted on
+- DROP only what carries no information:
+  device names ("on my MacBook"), body parts and manner ("with my right hand", "using the
+  on-screen keyboard"), posture and location filler ("while sitting at my desk"), screen
+  scaffolding ("on the screen", "in the input box"), and any verb already implied by another.
+- This is compression, never invention or summarisation. Do not replace a specific noun with a
+  generic one — "the Claude Code explanation about TanhTransformedDistribution" must NOT become
+  "explanations". No fixed word budget: as short as possible, but not one bit of signal shorter.
+
+CALIBRATION — these four are the standard:
+- action: "I read the Claude Code panel explanation about TanhTransformedDistribution and
+  change-of-variables log probability calculation."
+  action_brief: "I read the Claude Code explanation about TanhTransformedDistribution and
+  change-of-variables log probability."
+  ← keep the topic; it is the whole point of the segment. Only "panel" and the trailing
+    "calculation" go.
+- action: "I bring a clear glass bottle to the countertop water dispenser beside the sink and
+  set it on the dispenser tray."
+  action_brief: "I place a glass bottle."
+  ← two verbs → one; the dispenser/sink/tray are scenery, the bottle is the object.
+- action: "I type '感觉ai好慢' into the WeChat chat with 'babe' using the on-screen keyboard and
+  send it."
+  action_brief: "I send '感觉ai好慢' to babe."
+  ← keep BOTH the message text and the recipient; drop the keyboard and the app chrome.
+- action: "I rest my hand on top of the water dispenser while watching the glass bottle fill
+  with water."
+  action_brief: "I monitor the water filling."
+  ← the hand is incidental; the watching is the action.
+
+BAD (over-compression — loses signal):
+- "I read Claude explanations."            ← topic destroyed
+- "I send a WeChat message."               ← message text and recipient destroyed
+- "I interact with the interface."         ← everything destroyed
+
 ## Output Format
 Return a JSON object:
 {
@@ -620,6 +739,7 @@ Return a JSON object:
     {
       "time_range": "HH:MM:SS–HH:MM:SS",
       "action": "I grab a coke from the fridge.",
+      "action_brief": "I grab a coke.",
       "objects": ["specific objects I interact with or look at"],
       "environment": "FIRST segment: full establishing world state per Rule 4 (physical space, every visible object with state and position, complete screen content of every display, world text/signage, media playing, ambient audio). LATER segments: ONLY what changed since the previous segment, ignoring changes caused merely by head movement; 'No change.' is valid.",
       "text_visible": ["meaningful readable text I am attending to — skip trivial keyboard/packaging labels"],
