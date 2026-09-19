@@ -1,0 +1,28 @@
+# --- 凭据与密钥：永不提交 ---
+credentials/*
+!credentials/README.md
+*.secrets
+.env
+.env.*
+adc*.json
+my-project-*.json
+*service-account*.json
+*hf-jobs*.secrets
+
+# --- 本地测试与缓存产物 ---
+_test/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# --- _bench 保留脚本，丢弃其运行产物（合成素材可能达 GB 级） ---
+_bench/src/
+_bench/tmp/
+_bench/*.log
+
+# --- 操作系统 / 编辑器 ---
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

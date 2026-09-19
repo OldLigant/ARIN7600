@@ -1,0 +1,41 @@
+{
+  "release": "castle-batch-v1",
+  "created_utc": "2026-09-17T20:20:18Z",
+  "published_utc": "2026-09-16T18:52:22Z",
+  "provenance": {
+    "kind": "hf-bucket",
+    "detail": "D:\\QLD\\out\\castle-runs\\_relcheck\\castle-batch-v1",
+    "git_commit": null
+  },
+  "hash_scheme": "basename-v1",
+  "code_hash": "aa4896318bd362b41ae8c16a9662e6af81bcda71530ff60b38ecaf9f38c63763",
+  "identity_files": {
+    "batch_pipeline.py": "4e4f276ad095e43589e7a1ecf2b0aef63498317bcdec7d9413f3e7bae773198a",
+    "castle_pipeline/__init__.py": "5da1c28c424474bed2ceff998e072c7b8cfefbcb6f911e93ef1ef8995d80a73a",
+    "castle_pipeline/batch_cloud.py": "c9ff1651404f325a1126ca0e8ed529780ee125b2c9f62b714a0e4c4666ae245c",
+    "castle_pipeline/batch_engine.py": "5fc5d24a944ddeb260227ab66e379deb73c5605e5323d77c7ad3a74bd16f22a6",
+    "castle_pipeline/batch_tasks.py": "f6f7d055cbe3cfbdde69630577dbb1b23b201de37c812a9e2c9b7f7df48633ba",
+    "castle_pipeline/events.py": "a25ab2ce5703dc880d8d086dfc70815d21cae79f69e4e9dc2ca277e0e5972f5c",
+    "castle_pipeline/inputs.py": "28b34a44e4c0cb3f8576c32d02b539daf7a03800354dd69d70f2bfd664002e56",
+    "castle_pipeline/media.py": "ccb03eec0cf44d39a29fc72886fc0f6614f02d1439a5d5ad545e9132281ac9df",
+    "castle_pipeline/runner.py": "9ba80a9eaa166834d02faabef52fd8ffa3179ed1b74dd6bef422f71b88f7a84a",
+    "castle_pipeline/schema.py": "e3dfd63e38ccf6f194778a8fc32ec1a2026c0432b8a477791cb9ab3f615e8302",
+    "castle_pipeline/vertex.py": "8346f535b4e5990f511e631e4ea95e0bf25dca49c2d96d13cc0f6d0f0ba932ef"
+  },
+  "auxiliary_files": {
+    "batch_jobs.py": "b9da3fd2b14fe020c9c00948d0f94683fa0ecd5f625de3f5d834b582ea27472d",
+    "bootstrap_batch.py": "2ba808d8fd6e033b4f7914ffdd4bea51ad8df74af7704232b7a5e16f41d1ef65",
+    "jobs.py": "3b7bda8f5b92916010baf185d379e8e73292f6ea87b81a44d57cb9ed006abe3e",
+    "run_pipeline.py": "36e72c14bcb6fc384ed41bcb9040314aa610c89542a001295ee64b99a1040da5",
+    "Dockerfile": "d4a45c707f5e77ab30f910e449ddffc16fbc4759af982fd1fc8b37b66e14d678",
+    "requirements.txt": "c55e1f1b49eb188155b321e40afe0122a29c5c3018647bce58f2f616e0c0406e",
+    "requirements-batch.txt": "f17b8625b3774849426998e0698c7996f760c4b3faf0f49fcd05de98baa9219b"
+  },
+  "prompt_files": {
+    "prompts/annotation.md": "5d22f3b152a2c705dc56871f7ee0ea333f4f107c5efe7cd11a318a6981044e80",
+    "prompts/audio.md": "6cb8c38287d211c19ef58dde80ce27292c3062b616ed1ba864f895bb14408dcd",
+    "prompts/review.md": "bcdb5ee552c09ed9bbd5855c5e4bd289a252d74f238f71fb529988a5bb894624",
+    "prompts/review_regions.md": "bb17ca242d94f22512c3d88ffa9ef092664d560e111c27d7bcaad6b34bd4f435"
+  },
+  "notes": "Batch pipeline v1: initial Vertex Batch stage machine; serial per-clip prepare; maxOutputTokens hardcoded 16384. Pinned by run day1-bjorn-08-v1."
+}

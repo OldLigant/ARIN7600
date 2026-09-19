@@ -1,0 +1,24 @@
+# 本管线的身份标识是对源文件**原始字节**做 sha256
+# （batch_pipeline.code_hash() / runner.fingerprint）。行尾是字节的一部分。
+#
+# 绝不要对身份文件使用 text=auto：它会在写入索引时把 CRLF 静默改成 LF，
+# 而 `git status` 仍报告 clean。这样一次全新 checkout 算出的 code_hash 就与
+# 已钉住的 run 不符，所有 tick 都会被拒绝。castle_pipeline/media.py 目前就是
+# CRLF（313 处），它已被 castle-batch-v2/v3 的 code_hash 计入。
+
+# 非身份文件：保持 LF，便于阅读 diff。
+* text=auto eol=lf
+
+# 身份文件：逐字节保留，禁止任何行尾转换（后出现的规则优先）。
+batch_pipeline.py -text
+castle_pipeline/*.py -text
+prompts/*.md -text
+release.py -text
+
+# 二进制资源永不转换。
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.mp4 binary
+*.wav binary
+*.secrets binary

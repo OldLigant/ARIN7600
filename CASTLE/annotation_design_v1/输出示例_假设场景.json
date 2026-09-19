@@ -1,0 +1,220 @@
+{
+  "schema_version": "castle-caption-v1",
+  "scene_summary": "I pour clear liquid from a blue jug into a white mug and return the jug to the counter. A nearby person speaks and picks up a towel; a later camera turn reveals the dining table.",
+  "actors": [
+    {
+      "actor_id": "wearer",
+      "description": "The camera wearer, whose hands are visible during the jug and mug interaction."
+    },
+    {
+      "actor_id": "person_1",
+      "description": "A person wearing a red sweater beside the sink."
+    }
+  ],
+  "initial_environment": {
+    "time_sec": 0.0,
+    "description": "An indoor kitchen is illuminated by overhead lights. A light-colored countertop fills the foreground. An upright blue jug containing clear liquid stands to the left of an empty white mug; a folded white towel lies beside the sink on the right. A stainless-steel sink and a closed cabinet are visible behind the counter. Person_1 stands beside the sink. No screen or readable text is visible. The audio contains a faint steady appliance hum."
+  },
+  "visual_unavailable_intervals": [],
+  "segments": [
+    {
+      "segment_id": "s001",
+      "start_sec": 2.0,
+      "end_sec": 4.0,
+      "event_type": "action",
+      "actor_ids": ["wearer"],
+      "activity": "Preparing a drink",
+      "action": "I pick up the blue jug by its handle from the counter beside the white mug.",
+      "action_brief": "I pick up the blue jug from the counter.",
+      "objects": ["blue jug", "white mug"],
+      "environment": {
+        "world_changes": ["The blue jug is lifted from the counter and held in my right hand."],
+        "newly_observed": []
+      },
+      "text_visible": [],
+      "speech": null,
+      "details": "My right hand grips the jug handle. The mug stays on the counter.",
+      "evidence": [
+        {
+          "source_id": "video_0",
+          "modality": "visual",
+          "start_sec": 2.0,
+          "end_sec": 4.0,
+          "support": "direct",
+          "note": "The visible hand closes around the handle and lifts the jug clear of the counter."
+        }
+      ],
+      "boundary": {"start": "observed", "end": "observed", "precision": "video_estimate"},
+      "uncertainties": []
+    },
+    {
+      "segment_id": "s002",
+      "start_sec": 4.0,
+      "end_sec": 9.0,
+      "event_type": "action",
+      "actor_ids": ["wearer"],
+      "activity": "Preparing a drink",
+      "action": "I tilt the blue jug over the white mug and pour clear liquid into it, stopping before the mug is full.",
+      "action_brief": "I pour clear liquid from the blue jug into the white mug.",
+      "objects": ["blue jug", "white mug", "clear liquid"],
+      "environment": {
+        "world_changes": ["The white mug changes from empty to partially filled; the visible stream stops when I return the jug upright."],
+        "newly_observed": []
+      },
+      "text_visible": [],
+      "speech": null,
+      "details": "The jug is held in my right hand. The liquid's exact identity is not established.",
+      "evidence": [
+        {
+          "source_id": "video_0",
+          "modality": "visual",
+          "start_sec": 4.0,
+          "end_sec": 9.0,
+          "support": "direct",
+          "note": "A stream is visible between the tilted jug and the mug, and the mug's visible liquid level rises."
+        },
+        {
+          "source_id": "audio_0",
+          "modality": "audio",
+          "start_sec": 4.0,
+          "end_sec": 9.0,
+          "support": "direct",
+          "note": "A pouring sound accompanies the visible stream."
+        }
+      ],
+      "boundary": {"start": "observed", "end": "observed", "precision": "video_estimate"},
+      "uncertainties": ["The clear liquid cannot be identified as water or another drink from the available evidence."]
+    },
+    {
+      "segment_id": "s003",
+      "start_sec": 6.0,
+      "end_sec": 8.0,
+      "event_type": "speech",
+      "actor_ids": ["person_1"],
+      "activity": null,
+      "action": "Person_1 speaks while standing beside the sink.",
+      "action_brief": "Person_1 speaks.",
+      "objects": [],
+      "environment": {"world_changes": [], "newly_observed": []},
+      "text_visible": [],
+      "speech": {
+        "speaker_id": "person_1",
+        "source": "in_person",
+        "text": "Could you leave some for me?",
+        "verification": "audio_checked"
+      },
+      "details": "The speech overlaps the pouring action. The addressee is not explicitly established.",
+      "evidence": [
+        {
+          "source_id": "audio_0",
+          "modality": "audio",
+          "start_sec": 6.0,
+          "end_sec": 8.0,
+          "support": "direct",
+          "note": "The quoted sentence is intelligible in the audio."
+        },
+        {
+          "source_id": "video_0",
+          "modality": "visual",
+          "start_sec": 6.0,
+          "end_sec": 8.0,
+          "support": "direct",
+          "note": "Person_1's visible mouth movement aligns with this utterance."
+        }
+      ],
+      "boundary": {"start": "observed", "end": "observed", "precision": "audio_estimate"},
+      "uncertainties": ["The utterance's addressee is not confirmed."]
+    },
+    {
+      "segment_id": "s004",
+      "start_sec": 8.0,
+      "end_sec": 10.0,
+      "event_type": "action",
+      "actor_ids": ["person_1"],
+      "activity": null,
+      "action": "Person_1 picks up the folded white towel from beside the sink.",
+      "action_brief": "Person_1 picks up the white towel.",
+      "objects": ["folded white towel"],
+      "environment": {
+        "world_changes": ["The white towel moves from the counter into Person_1's hand."],
+        "newly_observed": []
+      },
+      "text_visible": [],
+      "speech": null,
+      "details": null,
+      "evidence": [
+        {
+          "source_id": "video_0",
+          "modality": "visual",
+          "start_sec": 8.0,
+          "end_sec": 10.0,
+          "support": "direct",
+          "note": "Person_1 reaches for the towel and lifts it away from the counter."
+        }
+      ],
+      "boundary": {"start": "observed", "end": "observed", "precision": "video_estimate"},
+      "uncertainties": []
+    },
+    {
+      "segment_id": "s005",
+      "start_sec": 9.0,
+      "end_sec": 11.0,
+      "event_type": "action",
+      "actor_ids": ["wearer"],
+      "activity": "Preparing a drink",
+      "action": "I set the blue jug upright on the counter to the left of the white mug and release its handle.",
+      "action_brief": "I place the blue jug on the counter beside the white mug.",
+      "objects": ["blue jug", "white mug"],
+      "environment": {
+        "world_changes": ["The blue jug is resting upright on the counter to the mug's left."],
+        "newly_observed": []
+      },
+      "text_visible": [],
+      "speech": null,
+      "details": "The right hand releases the handle after the jug's base contacts the counter.",
+      "evidence": [
+        {
+          "source_id": "video_0",
+          "modality": "visual",
+          "start_sec": 9.0,
+          "end_sec": 11.0,
+          "support": "direct",
+          "note": "The jug is lowered onto the counter and remains there after the hand withdraws."
+        }
+      ],
+      "boundary": {"start": "observed", "end": "observed", "precision": "video_estimate"},
+      "uncertainties": []
+    },
+    {
+      "segment_id": "s006",
+      "start_sec": 12.0,
+      "end_sec": 14.0,
+      "event_type": "observation",
+      "actor_ids": ["wearer"],
+      "activity": null,
+      "action": "The camera turns away from the counter toward the dining table.",
+      "action_brief": "The view turns toward the dining table.",
+      "objects": ["wooden dining table", "bowl containing sliced bread", "two empty chairs"],
+      "environment": {
+        "world_changes": [],
+        "newly_observed": ["A wooden dining table with a bowl containing sliced bread and two empty chairs comes into view. Its earlier state was not visible."]
+      },
+      "text_visible": [],
+      "speech": null,
+      "details": "The new view does not establish that the bowl was just placed on the table or that the wearer intends to sit down.",
+      "evidence": [
+        {
+          "source_id": "video_0",
+          "modality": "visual",
+          "start_sec": 12.0,
+          "end_sec": 14.0,
+          "support": "direct",
+          "note": "The camera pans away from the counter and reveals the table, bread bowl, and chairs."
+        }
+      ],
+      "boundary": {"start": "observed", "end": "observed", "precision": "video_estimate"},
+      "uncertainties": []
+    }
+  ],
+  "activity_chain": ["s001", "s002", "s005"]
+}

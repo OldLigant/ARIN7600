@@ -1,0 +1,14 @@
+# Local scratch: generated media, benchmark sources and pytest outputs.
+# Never publish these; see README for the hf buckets sync excludes.
+_bench/src/
+_bench/tt*/
+_bench/t*/
+_bench/result-*.json
+_bench/tmp*/
+_bench/batch-out/
+_bench/batch-scratch/
+_test/
+.pytest_cache/
+__pycache__/
+*.secrets
+*.pyc

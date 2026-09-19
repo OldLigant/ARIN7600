@@ -1,0 +1,157 @@
+{
+  "08 (v1, 120 audio)": {
+    "state_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/state.json",
+    "generation": 1789672286365186,
+    "summary": {
+      "status": "running",
+      "current_stage": "review",
+      "completed_count": 47,
+      "failure_records": 10,
+      "eligible_next": 63,
+      "selected": 120,
+      "model": "gemini-3.8-flash",
+      "review": true,
+      "start_clip": 0,
+      "max_clips": 120,
+      "media_tuning": {
+        "media_threads": null,
+        "decode_slots": null,
+        "footer_workers": null,
+        "prepare_workers": null
+      },
+      "stages": {
+        "audio": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/3338044871599456256",
+          "state": "JOB_STATE_SUCCEEDED",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/batch-output/audio-ef50f4707bc8d77e/prediction-model-2026-09-16T21:00:42.500556Z"
+        },
+        "annotation": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/6942824529588649984",
+          "state": "JOB_STATE_SUCCEEDED",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/batch-output/annotation-f83fb98cfd1366df/prediction-model-2026-09-17T03:32:28.265067Z"
+        },
+        "review": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/1488089070075641856",
+          "state": "JOB_STATE_PENDING",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/batch-output/review-d84551970feaa18a/"
+        }
+      }
+    },
+    "live_vertex": {
+      "audio": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/3338044871599456256",
+        "state": "JOB_STATE_SUCCEEDED",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/batch-output/audio-ef50f4707bc8d77e/prediction-model-2026-09-16T21:00:42.500556Z"
+      },
+      "annotation": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/6942824529588649984",
+        "state": "JOB_STATE_SUCCEEDED",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/batch-output/annotation-f83fb98cfd1366df/prediction-model-2026-09-17T03:32:28.265067Z"
+      },
+      "review": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/1488089070075641856",
+        "state": "JOB_STATE_RUNNING",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-08-v1/batch-output/review-d84551970feaa18a/"
+      }
+    }
+  },
+  "09 (v2, 118 audio)": {
+    "state_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/state.json",
+    "generation": 1789671821474774,
+    "summary": {
+      "status": "running",
+      "current_stage": "review",
+      "completed_count": 13,
+      "failure_records": 13,
+      "eligible_next": 94,
+      "selected": 120,
+      "model": "gemini-3.8-flash",
+      "review": true,
+      "start_clip": 0,
+      "max_clips": 120,
+      "media_tuning": {
+        "media_threads": 4,
+        "decode_slots": 3,
+        "footer_workers": 4,
+        "prepare_workers": 3
+      },
+      "stages": {
+        "audio": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/7722158371356278784",
+          "state": "JOB_STATE_SUCCEEDED",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/batch-output/audio-a3228d28c7aab60f/prediction-model-2026-09-16T22:13:23.690467Z"
+        },
+        "annotation": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/7068925319155023872",
+          "state": "JOB_STATE_SUCCEEDED",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/batch-output/annotation-badb724113b635b2/prediction-model-2026-09-17T03:32:25.401891Z"
+        },
+        "review": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/7231304494879866880",
+          "state": "JOB_STATE_PENDING",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/batch-output/review-30ccce7907f325ab/"
+        }
+      }
+    },
+    "live_vertex": {
+      "audio": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/7722158371356278784",
+        "state": "JOB_STATE_SUCCEEDED",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/batch-output/audio-a3228d28c7aab60f/prediction-model-2026-09-16T22:13:23.690467Z"
+      },
+      "annotation": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/7068925319155023872",
+        "state": "JOB_STATE_SUCCEEDED",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/batch-output/annotation-badb724113b635b2/prediction-model-2026-09-17T03:32:25.401891Z"
+      },
+      "review": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/7231304494879866880",
+        "state": "JOB_STATE_RUNNING",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-09-v2/batch-output/review-30ccce7907f325ab/"
+      }
+    }
+  },
+  "10-14 (v2, 600 clips)": {
+    "state_uri": "gs://castle-caption-batch/castle/day1-bjorn-10-14-v2/state.json",
+    "generation": 1789625246583535,
+    "summary": {
+      "status": "running",
+      "current_stage": "audio",
+      "completed_count": 0,
+      "failure_records": 0,
+      "eligible_next": 600,
+      "selected": 600,
+      "model": "gemini-3.8-flash",
+      "review": true,
+      "start_clip": 0,
+      "max_clips": 120,
+      "media_tuning": {
+        "media_threads": 4,
+        "decode_slots": 3,
+        "footer_workers": 4,
+        "prepare_workers": 3
+      },
+      "stages": {
+        "audio": {
+          "job": "projects/1073111426432/locations/global/batchPredictionJobs/6606567485535682560",
+          "state": "JOB_STATE_PENDING",
+          "error": null,
+          "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-10-14-v2/batch-output/audio-902b1f1e0d739d3a/"
+        }
+      }
+    },
+    "live_vertex": {
+      "audio": {
+        "name": "projects/1073111426432/locations/global/batchPredictionJobs/6606567485535682560",
+        "state": "JOB_STATE_SUCCEEDED",
+        "output_uri": "gs://castle-caption-batch/castle/day1-bjorn-10-14-v2/batch-output/audio-902b1f1e0d739d3a/prediction-model-2026-09-17T06:07:25.997443Z"
+      }
+    }
+  }
+}

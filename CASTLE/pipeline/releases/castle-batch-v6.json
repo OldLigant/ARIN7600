@@ -1,0 +1,42 @@
+{
+  "release": "castle-batch-v6",
+  "created_utc": "2026-09-19T23:19:08Z",
+  "published_utc": "2026-09-19T23:19:08Z",
+  "provenance": {
+    "kind": "git",
+    "detail": "D:\\QLD\\CASTLE\\pipeline",
+    "git_commit": "ef204d529ff4854101a66183d21ed02321ccc935"
+  },
+  "hash_scheme": "basename-v1",
+  "code_hash": "8c765a6f3dfb617b75afde6a46e390d261603f08e8517962f8c265ec0e663095",
+  "identity_files": {
+    "batch_pipeline.py": "83e4a8eac1ca6333b334109fa262345f0d2231d0ec443b7b44c36bd7181c5b9f",
+    "castle_pipeline/__init__.py": "5da1c28c424474bed2ceff998e072c7b8cfefbcb6f911e93ef1ef8995d80a73a",
+    "castle_pipeline/batch_cloud.py": "c9ff1651404f325a1126ca0e8ed529780ee125b2c9f62b714a0e4c4666ae245c",
+    "castle_pipeline/batch_engine.py": "5fc5d24a944ddeb260227ab66e379deb73c5605e5323d77c7ad3a74bd16f22a6",
+    "castle_pipeline/batch_tasks.py": "38bd41933526b9fc491d9bf4aee46539d659d8a52f627a585c3cf23670359ef9",
+    "castle_pipeline/events.py": "a25ab2ce5703dc880d8d086dfc70815d21cae79f69e4e9dc2ca277e0e5972f5c",
+    "castle_pipeline/inputs.py": "28b34a44e4c0cb3f8576c32d02b539daf7a03800354dd69d70f2bfd664002e56",
+    "castle_pipeline/media.py": "a7b15d39ca429d6fdc5d481e0cc766dfb1c7dbcf5b774302fb4d0bbf1060e7a6",
+    "castle_pipeline/runner.py": "cf77ce9b14e42d8de54d80165c7ec0387be4b768aef835ab16fb9250f8fd4455",
+    "castle_pipeline/schema.py": "e3dfd63e38ccf6f194778a8fc32ec1a2026c0432b8a477791cb9ab3f615e8302",
+    "castle_pipeline/vertex.py": "8346f535b4e5990f511e631e4ea95e0bf25dca49c2d96d13cc0f6d0f0ba932ef"
+  },
+  "auxiliary_files": {
+    "batch_jobs.py": "98a5f7fe8658ae0a3103113505a3bf4cd81ac581caa42ff9e38e3ccb28f7d46a",
+    "batch_tick.py": "fe69548007aefe18b15bb12a8deef1c02873614aca48e12f44e9938a4e2ddeea",
+    "bootstrap_batch.py": "2ba808d8fd6e033b4f7914ffdd4bea51ad8df74af7704232b7a5e16f41d1ef65",
+    "jobs.py": "cf4f3e526c3121fe3436b27b47ae8892ab0e4420c36fd52fed859a339828f5ed",
+    "run_pipeline.py": "16b5b084e464d2538a9360cd7d38d7c988b46bdfbc190f4c8490f1bfb92d1851",
+    "Dockerfile": "d4a45c707f5e77ab30f910e449ddffc16fbc4759af982fd1fc8b37b66e14d678",
+    "requirements.txt": "c55e1f1b49eb188155b321e40afe0122a29c5c3018647bce58f2f616e0c0406e",
+    "requirements-batch.txt": "f17b8625b3774849426998e0698c7996f760c4b3faf0f49fcd05de98baa9219b"
+  },
+  "prompt_files": {
+    "prompts/annotation.md": "5d22f3b152a2c705dc56871f7ee0ea333f4f107c5efe7cd11a318a6981044e80",
+    "prompts/audio.md": "6cb8c38287d211c19ef58dde80ce27292c3062b616ed1ba864f895bb14408dcd",
+    "prompts/review.md": "bcdb5ee552c09ed9bbd5855c5e4bd289a252d74f238f71fb529988a5bb894624",
+    "prompts/review_regions.md": "bb17ca242d94f22512c3d88ffa9ef092664d560e111c27d7bcaad6b34bd4f435"
+  },
+  "notes": "Auxiliary-only release: batch_tick.py mirrors collected stage JSON with bounded concurrency (CASTLE_MIRROR_WORKERS, default 16; measured 14.3x at 16 threads on a latency-bound walk) and batch_jobs.py creates hourly schedules with the API-accepted '@hourly' instead of the rejected 'hourly'. Core files and prompts are byte-identical to v3/v4/v5; existing same-hash runs remain compatible. No state/config migration."
+}

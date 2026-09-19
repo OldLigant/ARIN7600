@@ -1,0 +1,17 @@
+_test/
+__pycache__/
+.pytest_cache/
+**/__pycache__/
+*.secrets
+.env*
+tests/
+
+# 凭据目录：绝不能进入镜像构建上下文
+credentials/
+
+# 服务账号密钥形态的 JSON（`.dockerignore` 原先只覆盖了 *.secrets，漏掉了这一类）
+my-project-*.json
+*service-account*.json
+
+# _bench 只是本地排障脚本与合成素材，不属于运行时文件集
+_bench/

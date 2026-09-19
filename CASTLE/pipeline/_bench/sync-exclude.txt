@@ -1,0 +1,10 @@
+# Patterns passed to `hf buckets sync --filter-from` for the CASTLE code bucket.
+# Kept as a file because PowerShell expands glob patterns before `hf` sees them.
+# One pattern per line; lines starting with # are comments. Later rules win.
+_test/*
+.pytest_cache/*
+__pycache__/*
+_bench/*
+*.secrets
+.env*
+*.tmp
