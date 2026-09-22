@@ -110,6 +110,32 @@ def git_commit(tree: Path) -> str | None:
     return commit if proc.returncode == 0 and commit else None
 
 
+def git_root(tree: Path) -> Path | None:
+    """Resolve the enclosing repository, even when the pipeline is a subdirectory.
+
+    Publishing moved from a standalone repo (where the pipeline directory WAS
+    the root) into a monorepo checkout; every git invocation below must anchor
+    on the real root because ``git archive`` emits root-relative paths.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(tree), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    root = proc.stdout.strip() if proc.returncode == 0 else ""
+    return Path(root) if root else None
+
+
+def tagged_subtree(extracted: Path, tree: Path, root: Path | None) -> Path | None:
+    """Rebase an extracted ``git archive`` tree onto the pipeline subtree."""
+    if root is None or tree == root:
+        return extracted
+    subtree = extracted / tree.relative_to(root)
+    return subtree if subtree.is_dir() else None
+
+
 def build_manifest(release: str, tree: Path, *, scheme: str, provenance: str,
                    published_utc: str | None, notes: str) -> dict:
     identity = {p.relative_to(tree).as_posix(): sha256_file(p) for p in identity_paths(tree)}
@@ -271,20 +297,25 @@ def cmd_publish(args) -> int:
     target_prefix = args.code_bucket.rstrip("/") + "/" + args.release
     problems = []
 
-    if not (tree / ".git").exists():
+    root = git_root(tree)
+    if root is None:
         problems.append("not a git repository")
     if not _tag_exists(tree, args.release):
         problems.append(f"tag {args.release} does not exist; publish identity is a tag (R-02)")
 
     with tempfile.TemporaryDirectory(prefix="release-publish-") as work_dir:
         work = Path(work_dir)
-        tag_tree = _tag_tree(tree, args.release, work) if not problems else None
+        tag_tree = _tag_tree(root or tree, args.release, work) if not problems else None
         if tag_tree is None and not problems:
             problems.append(f"git archive of tag {args.release} failed")
         if tag_tree is not None:
-            drift = differences(manifest, tag_tree)
-            if drift:
-                problems.append(f"tagged tree disagrees with its manifest: {drift[:4]}")
+            tagged = tagged_subtree(tag_tree, tree, root)
+            if tagged is None:
+                problems.append(f"tag {args.release} does not contain {tree}")
+            else:
+                drift = differences(manifest, tagged)
+                if drift:
+                    problems.append(f"tagged tree disagrees with its manifest: {drift[:4]}")
             worktree_drift = differences(manifest, tree)
             if worktree_drift:
                 problems.append(
@@ -320,9 +351,14 @@ def cmd_publish(args) -> int:
 
     with tempfile.TemporaryDirectory(prefix="release-stage-") as work_dir:
         work = Path(work_dir)
-        tag_tree = _tag_tree(tree, args.release, work)
+        tag_tree = _tag_tree(git_root(tree) or tree, args.release, work)
         if tag_tree is None:
             print(json.dumps({"ok": False, "error": "TAG_ARCHIVE_FAILED"}, indent=2))
+            return 1
+        tagged = tagged_subtree(tag_tree, tree, git_root(tree))
+        if tagged is None:
+            print(json.dumps({"ok": False, "error": "TAGGED_SUBTREE_MISSING",
+                              "detail": f"tag {args.release} does not contain {tree}"}, indent=2))
             return 1
         # Publish exactly the manifest's file set. Exclude-patterns proved too easy
         # to get wrong: an earlier publish shipped the whole repo tree (tests,
@@ -331,7 +367,7 @@ def cmd_publish(args) -> int:
         declared = sorted(set(manifest["identity_files"]) | set(manifest["auxiliary_files"])
                           | set(manifest["prompt_files"]))
         for name in declared:
-            source = tag_tree / name
+            source = tagged / name
             if not source.is_file():
                 print(json.dumps({"ok": False, "error": "MANIFEST_FILE_MISSING_FROM_TAG",
                                   "file": name}, indent=2))

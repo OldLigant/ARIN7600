@@ -25,11 +25,11 @@ REPO = Path(__file__).resolve().parents[1]
 
 def release_tags():
     """Every manifest that also exists as a tag; the test audits all of them."""
-    if not (REPO/'.git').exists():
-        return []
     listed = subprocess.run(['git', '-C', str(REPO), 'tag', '--list'],
                             capture_output=True, text=True, check=False)
-    tags = set(listed.stdout.split()) if listed.returncode == 0 else set()
+    if listed.returncode != 0:
+        return []  # not inside any git repository
+    tags = set(listed.stdout.split())
     return sorted(str(p.stem) for p in (REPO/'releases').glob('*.json') if p.stem in tags)
 
 
@@ -77,11 +77,13 @@ def test_tagged_release_matches_its_manifest(tag):
     """Every tag and its manifest must describe the same bytes."""
     if tag is None:
         pytest.skip('not a git repository, or no manifest has a tag')
+    root = release.git_root(REPO)
+    assert root is not None, 'the pipeline directory must live inside a git repository'
     manifest = json.loads((REPO/'releases'/f'{tag}.json').read_text(encoding='utf-8'))
     with tempfile.TemporaryDirectory(prefix='release-tag-') as work:
         work_path = Path(work)
         archive = work_path/'tag.tar'
-        made = subprocess.run(['git', '-C', str(REPO), 'archive', '--format=tar',
+        made = subprocess.run(['git', '-C', str(root), 'archive', '--format=tar',
                                '-o', str(archive), tag],
                               capture_output=True, text=True, check=False)
         if made.returncode != 0:
@@ -90,7 +92,10 @@ def test_tagged_release_matches_its_manifest(tag):
         tree.mkdir()
         with tarfile.open(archive) as tar:
             tar.extractall(tree, filter='data')  # archive produced locally by git
-        assert release.differences(manifest, tree) == []
+        # git archive emits root-relative paths; rebase onto the pipeline subtree.
+        tagged = release.tagged_subtree(tree, REPO, root)
+        assert tagged is not None, f'tag {tag} predates the monorepo layout or lacks the pipeline subtree'
+        assert release.differences(manifest, tagged) == []
 
 
 def test_publishing_a_changed_tree_under_an_existing_release_is_refused(tmp_path):
