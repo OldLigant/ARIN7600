@@ -1,10 +1,8 @@
-"""The canonical request shape is pinned here.
+"""Pin shared prompt, context and media ordering across the two runners.
 
-Released batch runs (v1-v6) produced exactly these bytes; the pin fails if the
-shared builders drift, and it is the reference the online runner must mirror
-(see test_pipeline_integration.test_online_requests_mirror_the_canonical_request_spec).
-Synthetic prompts keep the pin readable; the real prompt files are hashed into
-run identity separately.
+Structured output changes generationConfig for new runs; released runs remain
+bound to their own code hashes. Synthetic prompts keep the pin readable; real
+prompt files are hashed into run identity separately.
 """
 import json
 from pathlib import Path
@@ -77,7 +75,9 @@ def test_annotation_request_is_pinned_byte_for_byte(tmp_path):
     assert [p.get('text') or p['fileData']['fileUri'] for p in parts[1:]] == [
         'gs://b/f0.jpg', 'frame_index=0; clip_sec=0.0; source_id=video_0',
         'gs://b/f1.jpg', 'frame_index=1; clip_sec=1.5; source_id=video_0']
-    assert row['request']['generationConfig'] == {'responseMimeType': 'application/json', 'maxOutputTokens': 32768}
+    assert row['request']['generationConfig'] == {
+        'responseMimeType': 'application/json', 'maxOutputTokens': 32768,
+        'responseSchema': request_spec.response_schema_for_stage('annotation')}
 
 
 def test_audio_and_review_requests_are_pinned(tmp_path):

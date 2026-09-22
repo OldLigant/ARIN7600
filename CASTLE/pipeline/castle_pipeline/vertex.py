@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Any, Callable
 
-from .request_spec import AUDIO_SOURCE_LABEL, DEFAULT_MAX_OUTPUT_TOKENS
+from .request_spec import AUDIO_SOURCE_LABEL, DEFAULT_MAX_OUTPUT_TOKENS, response_schema_for_stage
 
 
 MAX_INLINE_BYTES = 18 * 1024 * 1024
@@ -288,10 +288,14 @@ class VertexProvider:
             try:
                 self._emit("request_start", **fields, attempt=attempt,
                            queue_wait_sec=attempt_started - queued)
+                generation_config = {"system_instruction": prompt,
+                                     "response_mime_type": "application/json",
+                                     "max_output_tokens": max_output_tokens}
+                if fields["phase"] in {"audio", "annotation", "review"}:
+                    generation_config["response_schema"] = response_schema_for_stage(fields["phase"])
                 response = self._client().models.generate_content(
                     model=self.model, contents=contents,
-                    config={"system_instruction": prompt, "response_mime_type": "application/json",
-                            "max_output_tokens": max_output_tokens})
+                    config=generation_config)
             except ProviderError as exc:
                 release(attempt)
                 exc.attempts = attempt

@@ -11,7 +11,8 @@ from .runner import atomic_json, cleanup_media
 from .media import positive_int
 from .request_spec import (DEFAULT_MAX_OUTPUT_TOKENS, AUDIO_SOURCE_LABEL, annotation_prompt,
                            annotation_stage_context, audio_stage_context, base_context,
-                           crop_label, frame_label, review_prompt, review_stage_context)
+                           crop_label, frame_label, review_prompt, review_stage_context,
+                           response_schema_for_stage)
 from .schema import validate_audio, normalize_annotation, apply_review
 
 MARKER = 'CASTLE_BATCH_ID:'
@@ -24,10 +25,14 @@ def request_row(request_id, prompt, context, media, max_output_tokens=DEFAULT_MA
             raise ValueError('Batch media must use persistent GCS URIs')
         parts.append({'fileData': {'fileUri': uri, 'mimeType': mime}})
         parts.append({'text': label})
+    stage = request_id.partition(':')[0]
+    generation = {'responseMimeType': 'application/json',
+                  'maxOutputTokens': positive_int(max_output_tokens, 'max_output_tokens')}
+    if stage in {'audio', 'annotation', 'review'}:
+        generation['responseSchema'] = response_schema_for_stage(stage)
     return {'request': {'systemInstruction': {'parts': [{'text': prompt}]},
                         'contents': [{'role': 'user', 'parts': parts}],
-                        'generationConfig': {'responseMimeType': 'application/json',
-                                             'maxOutputTokens': positive_int(max_output_tokens, 'max_output_tokens')}}}
+                        'generationConfig': generation}}
 
 
 def response_id(row):
