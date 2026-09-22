@@ -26,6 +26,7 @@
 - 私有绑定、真实 SA 文件名/邮箱及账号标签仅留本机 `credentials/`，不写公开文档、ledger、STATUS 或云端产物。`credentials/README.md` 是受 Git 跟踪的公共说明，不能填真实关联。
 - `--credentials-file` 只管本机 launcher 查询；HF worker 的 secret 必须另外从同一份 JSON 加载，用后清理本机环境变量。HF token 与 GCP ADC 是两种凭据。
 - 公开运行事件只经 `ledger.py append` 写入 `ledger/ledger.jsonl`，随后 `ledger.py validate`；不手改旧行，不追加账号关联。
+- 每次追加 ledger 或重新生成 `STATUS.md` 后，用 `tools/push_ops.py --execute` 把这两个文件同步到输出 bucket 的 `ops/` 前缀（先渲染核对再执行）。`ops/` 是可覆盖的查看副本；权威仍是本地 Git 的 ledger 与 GCS state。只上传这两个文件，不把 credentials/、run 绑定或任何发布目录写进 ops/。
 
 ## 版本与发布
 

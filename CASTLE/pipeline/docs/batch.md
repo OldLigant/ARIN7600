@@ -46,7 +46,7 @@ GCS `results/audio/<clip_id>.json`、`results/annotation/<clip_id>.json`、`resu
 
 同一 run / HF 输出前缀仍只允许一个写入 worker；不要让手动 tick 与 schedule 或两条 schedule 重叠。同步会在下载前和写入前检查目标内容，但这不是跨容器原子锁：HF 挂载没有跨节点锁或多写入者冲突保护，`--no-concurrency` 也只约束单条 schedule。[HF 挂载的一致性边界](https://github.com/huggingface/hf-mount#best-for--not-for)
 
-`ledger/ledger.jsonl` 是运行台账：记录 Job ID、视频范围、代码版本及状态变化。通过 `ledger.py append` 追加事件，再用 `tools/report.py` 生成状态文档。它不存放标注正文，也不能替代 GCS state。
+`ledger/ledger.jsonl` 是运行台账：记录 Job ID、视频范围、代码版本及状态变化。通过 `ledger.py append` 追加事件，再用 `tools/report.py` 生成状态文档。它不存放标注正文，也不能替代 GCS state。追加 ledger 或重新生成 STATUS 后，用 `tools/push_ops.py --execute` 把这两个文件同步到输出 bucket 的 `ops/` 前缀，作为给没有本仓库检出的操作者（人或 LLM）的查看副本；本地 Git 与 GCS state 仍是权威。
 
 关于以后让新 run 继承旧 audio、解耦在线 / Batch 身份，以及只读发布内容核验，见 [版本演进的边界与实施依据](version-evolution-decisions.md)。这些是按需实施的设计记录，当前没有 import-stage 或原 run 中途升级的接口。
 
