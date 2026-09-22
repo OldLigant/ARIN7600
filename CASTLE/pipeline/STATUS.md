@@ -2,7 +2,7 @@
 
 # CASTLE 状态
 
-本文件由 `tools/report.py` 生成，探测时间 **2026-09-19T20:18:32Z**。
+本文件由 `tools/report.py` 生成，探测时间 **2026-09-22T15:14:10Z**。
 手工修改会在下一次生成时被覆盖；任何云端断言都必须带这个时间戳。
 
 ## 已发布 release
@@ -13,6 +13,8 @@
 | `castle-batch-v2` | `1d53e2b1` | 2026-09-16T21:43:05Z | `basename-v1` | Batch pipeline v2: media decode parallelism (media_threads/decode_slots/footer_workers/prepare-workers) + decoder-buffer admission check. Changed batch_pipeline.py, media.py, runner.py. Pinned by runs day1-bjorn-09-v2 and day1-bjorn-10-14-v2. |
 | `castle-batch-v3` | `8c765a6f` | 2026-09-17T18:59:27Z | `basename-v1` | Batch pipeline v3: maxOutputTokens 16384->32768 plus --max-output-tokens, after MAX_TOKENS truncation lost whole clips. Changed batch_pipeline.py, batch_tasks.py. Pinned by runs day1-allie-13-14-18-20-v3 and day1-bjorn-15-20-v3. |
 | `castle-batch-v4` | `8c765a6f` | - | `basename-v1` | Launcher-only release: batch_jobs.py gains --code-volume auto, which reads the run's pinned code_hash and mounts the matching release, and refuses a contradicting --code-volume before submitting (R-05). Identity files are byte-identical to castle-batch-v3, so code_hash is unchanged and every run pinned to v3 remains tickable with either release. |
+| `castle-batch-v5` | `8c765a6f` | - | `basename-v1` | Auxiliary-only release: early hourly scheduling plus batch_tick.py mirrors collected GCS stage JSON into the HF output mount after each tick. Core files and prompts are byte-identical to v3/v4; existing same-hash runs remain compatible. No state/config migration. |
+| `castle-batch-v6` | `8c765a6f` | 2026-09-19T23:19:08Z | `basename-v1` | Auxiliary-only release: batch_tick.py mirrors collected stage JSON with bounded concurrency (CASTLE_MIRROR_WORKERS, default 16; measured 14.3x at 16 threads on a latency-bound walk) and batch_jobs.py creates hourly schedules with the API-accepted '@hourly' instead of the rejected 'hourly'. Core files and prompts are byte-identical to v3/v4/v5; existing same-hash runs remain compatible. No state/config migration. |
 
 ## Batch run 实况
 
@@ -20,9 +22,10 @@
 |---|---|---|---:|---:|---:|---|
 | `day1-bjorn-08-v1` | `castle-batch-v1` / `aa489631` | None | 110 | 10 | 0 | audio: SUCCEEDED, annotation: SUCCEEDED, review: SUCCEEDED |
 | `day1-bjorn-09-v2` | `castle-batch-v2` / `1d53e2b1` | None | 105 | 15 | 0 | audio: SUCCEEDED, annotation: SUCCEEDED, review: SUCCEEDED |
-| `day1-bjorn-10-14-v2` | `castle-batch-v2` / `1d53e2b1` | review | 275 | 33 | 292 | audio: SUCCEEDED, annotation: SUCCEEDED, review: RUNNING |
-| `day1-allie-13-14-18-20-v3` | `castle-batch-v3` / `8c765a6f` (同哈希: `castle-batch-v4`) | annotation | 0 | 4 | 596 | audio: SUCCEEDED, annotation: RUNNING |
-| `day1-bjorn-15-20-v3` | `castle-batch-v3` / `8c765a6f` (同哈希: `castle-batch-v4`) | annotation | 0 | 4 | 716 | audio: SUCCEEDED, annotation: RUNNING |
+| `day1-bjorn-10-14-v2` | `castle-batch-v2` / `1d53e2b1` | None | 566 | 34 | 0 | audio: SUCCEEDED, annotation: SUCCEEDED, review: SUCCEEDED |
+| `day1-allie-13-14-18-20-v3` | `castle-batch-v6` / `8c765a6f` (同哈希: `castle-batch-v3`, `castle-batch-v5`, `castle-batch-v4`) | None | 568 | 32 | 0 | audio: SUCCEEDED, annotation: SUCCEEDED, review: SUCCEEDED |
+| `day1-bjorn-15-20-v3` | `castle-batch-v6` / `8c765a6f` (同哈希: `castle-batch-v3`, `castle-batch-v5`, `castle-batch-v4`) | None | 680 | 40 | 0 | audio: SUCCEEDED, annotation: SUCCEEDED, review: SUCCEEDED |
+| `day1-florian-08-09-v6` | `castle-batch-v6` / `8c765a6f` (同哈希: `castle-batch-v3`, `castle-batch-v5`, `castle-batch-v4`) | None | 220 | 20 | 0 | audio: SUCCEEDED, annotation: SUCCEEDED, review: SUCCEEDED |
 
 ## 各阶段实测耗时（Vertex 时间戳）
 
@@ -36,13 +39,18 @@
 | `day1-bjorn-09-v2` | review | SUCCEEDED | 40.8 | 4123.0 | 94 | 43.9 |
 | `day1-bjorn-10-14-v2` | audio | SUCCEEDED | 32.2 | 4213.4 | 600 | 7.0 |
 | `day1-bjorn-10-14-v2` | annotation | SUCCEEDED | 87.1 | 24920.4 | 597 | 41.7 |
-| `day1-bjorn-10-14-v2` | review | RUNNING | 99.7 | 进行中 | 174 | — |
+| `day1-bjorn-10-14-v2` | review | SUCCEEDED | 99.7 | 34304.4 | 292 | 117.5 |
 | `day1-allie-13-14-18-20-v3` | audio | SUCCEEDED | 87.6 | 18768.4 | 600 | 31.3 |
-| `day1-allie-13-14-18-20-v3` | annotation | RUNNING | 88.7 | 进行中 | 595 | — |
+| `day1-allie-13-14-18-20-v3` | annotation | SUCCEEDED | 88.7 | 33790.3 | 596 | 56.7 |
+| `day1-allie-13-14-18-20-v3` | review | SUCCEEDED | 86.1 | 434.7 | 349 | 1.2 |
 | `day1-bjorn-15-20-v3` | audio | SUCCEEDED | 83.7 | 17468.6 | 720 | 24.3 |
-| `day1-bjorn-15-20-v3` | annotation | RUNNING | 85.6 | 进行中 | 661 | — |
+| `day1-bjorn-15-20-v3` | annotation | SUCCEEDED | 85.6 | 34396.9 | 716 | 48.0 |
+| `day1-bjorn-15-20-v3` | review | SUCCEEDED | 73.2 | 741.4 | 416 | 1.8 |
+| `day1-florian-08-09-v6` | audio | SUCCEEDED | 32.4 | 1242.8 | 240 | 5.2 |
+| `day1-florian-08-09-v6` | annotation | SUCCEEDED | 83.8 | 6233.2 | 238 | 26.2 |
+| `day1-florian-08-09-v6` | review | SUCCEEDED | 63.2 | 1042.7 | 164 | 6.4 |
 
-已完成阶段的均值：annotation 43.3 s/clip (n=3)；audio 14.1 s/clip (n=5)；review 31.6 s/clip (n=2)。 排队均值 82 s（最大 203 s）。
+已完成阶段的均值：annotation 43.5 s/clip (n=6)；audio 12.6 s/clip (n=6)；review 31.7 s/clip (n=6)。 排队均值 78 s（最大 203 s）。
 
 ## 已记录的 Job（ledger，最新状态）
 
@@ -64,6 +72,18 @@
 | `6aae710752d0dbd7f1d6e6d9` | tick | succeeded | `castle-batch-v4` | User authorized collection and progression of existing scope on 2026-09-19; no f |
 | `6aae710f52d0dbd7f1d6e6db` | tick | succeeded | `castle-batch-v4` | User authorized collection and progression of existing scope on 2026-09-19; no f |
 | `6aae710052d0dbd7f1d6e6d7` | tick | succeeded | `castle-batch-v2` | User authorized collection and progression of existing scope on 2026-09-19; no f |
+| `6aaf03a051992417dfccb1ef` | tick | succeeded | `castle-batch-v5` | Allie annotation collected (final 0->221, failures 4->30); review batch 30271678 |
+| `6aaf075852d0dbd7f1d71174` | tick | succeeded | `castle-batch-v5` | Bjorn 15-20 annotation collected (final 0->264, failures 4->40); review batch 67 |
+| `6aaf075e51992417dfccb2ae` | tick | succeeded | `castle-batch-v2` | Bjorn 10-14 review collected (final 275->566, failures 33->34); run is now compl |
+| `6aaf120f52d0dbd7f1d713ef` | tick | succeeded | `castle-batch-v5` | Allie review collected (final 221->568, failures 30->32); run is now complete_wi |
+| `6aaf141f52d0dbd7f1d71470` | hourly-tick | superseded | `castle-batch-v5` | Superseded by schedule 6aaf18bb52d0dbd7f1d71571 on v6. Deleted before it ever fi |
+| `6aaf220852d0dbd7f1d717a9` | hourly-tick | succeeded | `castle-batch-v6` | Scheduled @hourly tick fired at 00:00:08Z on castle-batch-v6; collected the 416- |
+| `6aaf18bb52d0dbd7f1d71571` | hourly-tick | info | `castle-batch-v6` | Current state of this schedule: suspend=true (verified 2026-09-20T10:31Z). The e |
+| `6aafb8f351992417dfcccad7` | prepare | succeeded | `castle-batch-v6` | 240/240 clips prepared across Florian 08 and 09 in 50m34s; audio batch 918103767 |
+| `6aafcac952d0dbd7f1d73e96` | tick | succeeded | `castle-batch-v6` | Collected the audio stage: 238 of 240 rows usable (2 audio failures) and submitt |
+| `6aafe6e852d0dbd7f1d74436` | tick | succeeded | `castle-batch-v6` | Collected the annotation stage: 220 rows accepted (completed 0->220, failures 2- |
+| `6aaff4f852d0dbd7f1d7478b` | tick | succeeded | `castle-batch-v6` | Closing tick for day1-florian-08-09-v6: collected the review stage (164 rows) an |
+| `6aafb90252d0dbd7f1d73ae1` | hourly-tick | info | `castle-batch-v6` | Schedule suspended on 2026-09-22 after the run had been terminal since 2026-09-2 |
 
 ## 尚未实施的能力
 

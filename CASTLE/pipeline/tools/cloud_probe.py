@@ -31,6 +31,7 @@ RUNS = {
     'day1-bjorn-10-14-v2': 'castle/day1-bjorn-10-14-v2',
     'day1-allie-13-14-18-20-v3': 'castle/day1-allie-13-14-18-20-v3',
     'day1-bjorn-15-20-v3': 'castle/day1-bjorn-15-20-v3',
+    'day1-florian-08-09-v6': 'castle/day1-florian-08-09-v6',
 }
 PROJECT = 'my-project-omni-507802'
 LOCATION = 'global'
