@@ -1,0 +1,43 @@
+{
+  "release": "castle-batch-v8",
+  "created_utc": "2026-09-22T19:36:55Z",
+  "published_utc": null,
+  "provenance": {
+    "kind": "git",
+    "detail": "D:\\QLD\\ARIN7600\\CASTLE\\pipeline",
+    "git_commit": "45537db1085c16fb49dad18ce880fa2469bff431"
+  },
+  "hash_scheme": "basename-v1",
+  "code_hash": "269a4f419054df3a007c0c545809fdfb2e913f8d0ff215651d9fd67b0131f78f",
+  "identity_files": {
+    "batch_pipeline.py": "83e4a8eac1ca6333b334109fa262345f0d2231d0ec443b7b44c36bd7181c5b9f",
+    "castle_pipeline/__init__.py": "5da1c28c424474bed2ceff998e072c7b8cfefbcb6f911e93ef1ef8995d80a73a",
+    "castle_pipeline/batch_cloud.py": "c9ff1651404f325a1126ca0e8ed529780ee125b2c9f62b714a0e4c4666ae245c",
+    "castle_pipeline/batch_engine.py": "5fc5d24a944ddeb260227ab66e379deb73c5605e5323d77c7ad3a74bd16f22a6",
+    "castle_pipeline/batch_tasks.py": "20b9dff1a0763efd3496847cd46b1405a3398066b9d95a878943010f79cf4ef9",
+    "castle_pipeline/events.py": "a25ab2ce5703dc880d8d086dfc70815d21cae79f69e4e9dc2ca277e0e5972f5c",
+    "castle_pipeline/inputs.py": "28b34a44e4c0cb3f8576c32d02b539daf7a03800354dd69d70f2bfd664002e56",
+    "castle_pipeline/media.py": "a7b15d39ca429d6fdc5d481e0cc766dfb1c7dbcf5b774302fb4d0bbf1060e7a6",
+    "castle_pipeline/request_spec.py": "9ca09951508ecccc9a73dd0226d41502889066a8b1e4b341073f630ef40c7752",
+    "castle_pipeline/runner.py": "5f254e8d2dfbb30f7a7407618e60848b10c43a651df77f649a2e1d6c1d4d7cf1",
+    "castle_pipeline/schema.py": "e3dfd63e38ccf6f194778a8fc32ec1a2026c0432b8a477791cb9ab3f615e8302",
+    "castle_pipeline/vertex.py": "7a080f23183a1a9e198cd98fe125e70e6a8cb7314ee39365304af621c317b56a"
+  },
+  "auxiliary_files": {
+    "batch_jobs.py": "98a5f7fe8658ae0a3103113505a3bf4cd81ac581caa42ff9e38e3ccb28f7d46a",
+    "batch_tick.py": "fe69548007aefe18b15bb12a8deef1c02873614aca48e12f44e9938a4e2ddeea",
+    "bootstrap_batch.py": "2ba808d8fd6e033b4f7914ffdd4bea51ad8df74af7704232b7a5e16f41d1ef65",
+    "jobs.py": "cf4f3e526c3121fe3436b27b47ae8892ab0e4420c36fd52fed859a339828f5ed",
+    "run_pipeline.py": "baa3eb7d1f536d5272d3413391af206d254a3aebcb2b2d604455ceecac938c16",
+    "Dockerfile": "d4a45c707f5e77ab30f910e449ddffc16fbc4759af982fd1fc8b37b66e14d678",
+    "requirements.txt": "c55e1f1b49eb188155b321e40afe0122a29c5c3018647bce58f2f616e0c0406e",
+    "requirements-batch.txt": "f17b8625b3774849426998e0698c7996f760c4b3faf0f49fcd05de98baa9219b"
+  },
+  "prompt_files": {
+    "prompts/annotation.md": "5d22f3b152a2c705dc56871f7ee0ea333f4f107c5efe7cd11a318a6981044e80",
+    "prompts/audio.md": "6cb8c38287d211c19ef58dde80ce27292c3062b616ed1ba864f895bb14408dcd",
+    "prompts/review.md": "bcdb5ee552c09ed9bbd5855c5e4bd289a252d74f238f71fb529988a5bb894624",
+    "prompts/review_regions.md": "bb17ca242d94f22512c3d88ffa9ef092664d560e111c27d7bcaad6b34bd4f435"
+  },
+  "notes": "Core release: add shared Vertex response schemas to Batch and online standard/flex audio, annotation, and review requests; retain local semantic validation."
+}
