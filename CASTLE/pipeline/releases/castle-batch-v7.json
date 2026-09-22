@@ -1,11 +1,11 @@
 {
   "release": "castle-batch-v7",
-  "created_utc": "2026-09-22T18:25:20Z",
-  "published_utc": null,
+  "created_utc": "2026-09-22T18:30:31Z",
+  "published_utc": "2026-09-22T18:28:20Z",
   "provenance": {
     "kind": "git",
     "detail": "D:\\QLD\\ARIN7600\\CASTLE\\pipeline",
-    "git_commit": "d05b40f5a08886e1c601df5522e755e9b7773349"
+    "git_commit": "ff541fbcfd08a53f622edf7a396ac1c27044e1f4"
   },
   "hash_scheme": "basename-v1",
   "code_hash": "0ff1a897de2afb67f64a40ba2f40c0179413454ac238cd013cc4ebfdad18d887",

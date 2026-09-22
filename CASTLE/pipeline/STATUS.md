@@ -2,7 +2,7 @@
 
 # CASTLE 状态
 
-本文件由 `tools/report.py` 生成，探测时间 **2026-09-22T15:14:10Z**。
+本文件由 `tools/report.py` 生成，探测时间 **2026-09-22T18:30:53Z**。
 手工修改会在下一次生成时被覆盖；任何云端断言都必须带这个时间戳。
 
 ## 已发布 release
@@ -15,6 +15,7 @@
 | `castle-batch-v4` | `8c765a6f` | - | `basename-v1` | Launcher-only release: batch_jobs.py gains --code-volume auto, which reads the run's pinned code_hash and mounts the matching release, and refuses a contradicting --code-volume before submitting (R-05). Identity files are byte-identical to castle-batch-v3, so code_hash is unchanged and every run pinned to v3 remains tickable with either release. |
 | `castle-batch-v5` | `8c765a6f` | - | `basename-v1` | Auxiliary-only release: early hourly scheduling plus batch_tick.py mirrors collected GCS stage JSON into the HF output mount after each tick. Core files and prompts are byte-identical to v3/v4; existing same-hash runs remain compatible. No state/config migration. |
 | `castle-batch-v6` | `8c765a6f` | 2026-09-19T23:19:08Z | `basename-v1` | Auxiliary-only release: batch_tick.py mirrors collected stage JSON with bounded concurrency (CASTLE_MIRROR_WORKERS, default 16; measured 14.3x at 16 threads on a latency-bound walk) and batch_jobs.py creates hourly schedules with the API-accepted '@hourly' instead of the rejected 'hourly'. Core files and prompts are byte-identical to v3/v4/v5; existing same-hash runs remain compatible. No state/config migration. |
+| `castle-batch-v7` | `0ff1a897` | 2026-09-22T18:28:20Z | `basename-v1` | Core release: online and batch requests now built from shared castle_pipeline/request_spec.py. Canonical shape is what v1-v6 batch runs already sent (six-scenario golden dump byte-identical); the online runner converges onto it, gaining max_output_tokens 32768 default, --max-output-tokens flag and the token budget in its fingerprint (run_pipeline.py). First core-identity change since v3: new code_hash; request semantics identical to v3-v6, so results remain comparable. |
 
 ## Batch run 实况
 
