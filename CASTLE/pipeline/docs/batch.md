@@ -17,7 +17,7 @@ GCS `state.json` 是状态依据，HF `/output` 保存最终标注、日志和�
 
 2026-09-23 起，在线与 Batch 的**请求构造共享同一实现**（`castle_pipeline/request_spec.py`）：同一份提示词后缀、context 键序、媒体标注与 part 顺序、默认 token 预算。规范形以 v1–v6 已发布 Batch run 实际发出的请求为准，重构后 Batch 请求字节经黄金样本比对不变；在线 `run_pipeline.py` 由此成为同素材 Batch 请求的预演（此前在线硬编码 16384 token 且各处文案独立漂移）。差异只剩传输层与限流重试策略。该改动改变核心 `code_hash`，下一条新 Batch run 需要新 release；旧 run 继续钉在原版本，不受影响。
 
-后续开发版本又为三个模型阶段加上共享的 Vertex `responseSchema`。每条 Batch JSONL 请求在 `generationConfig` 中带自己的 schema；在线 standard/flex 请求使用同一份 schema。该变更会再次改变核心 `code_hash`，须发布新版本后才用于新的 Batch run；旧 run 仍使用它们各自的发布字节。服务端 schema 约束输出形状，本地语义校验仍负责时间、证据与引用关系。
+`castle-batch-v8` 为三个模型阶段加上共享的 Vertex `responseSchema`。每条 Batch JSONL 请求在 `generationConfig` 中带自己的 schema；在线 standard/flex 请求使用同一份 schema。该变更改变核心 `code_hash`，新 Batch run 可使用 v8；旧 run 仍使用它们各自的发布字节。服务端 schema 约束输出形状，本地语义校验仍负责时间、证据与引用关系。
 
 这里的“收集”不是重新调用模型：worker 读取 GCS 中的原始预测，按 request_id 对应 clip，校验后保存阶段结果；不需要下一阶段的 clip 生成 final，并写入 GCS 和 HF 输出 bucket。当前 `tick` 会在收集后立即提交需要的下一阶段，所以 audio 的 tick 可以产生新的 annotation Batch，annotation 的 tick 可以产生 review Batch。只想查看状态时使用只读探测工具，不要执行 tick。
 

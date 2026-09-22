@@ -8,7 +8,7 @@
 
 两种模式的**模型请求构造共享同一实现**（`castle_pipeline/request_spec.py`）：相同的基础提示词与后缀、相同的 context JSON 键序、相同的媒体标注与 part 顺序、相同的默认 `max_output_tokens`（32768）。v7 发布时以 v1–v6 Batch 请求为规范形，使当时的 Batch 请求字节不变；在线运行相当于同素材 Batch 请求的预演。两种模式的传输层仍有差异（inline base64 vs GCS `fileData`，以及 Batch 独有的 `CASTLE_BATCH_ID` 关联标记），限流重试策略也不同。
 
-当前开发版本在 audio、annotation、review 请求中增加共享的 Vertex `responseSchema`，在线 standard/flex 与新 Batch run 均使用它约束 JSON 形状。已发布版本的请求和旧 run 不变；新请求形状需要作为新 release 发布。`responseSchema` 只覆盖服务端支持的字段、类型和枚举；片段时间、证据来源、人物引用等跨字段规则仍由 `castle_pipeline/schema.py` 在收到结果后校验。
+`castle-batch-v8` 在 audio、annotation、review 请求中增加共享的 Vertex `responseSchema`，在线 standard/flex 与新 Batch run 均使用它约束 JSON 形状。旧 run 继续钉在各自的发布版本。`responseSchema` 只覆盖服务端支持的字段、类型和枚举；片段时间、证据来源、人物引用等跨字段规则仍由 `castle_pipeline/schema.py` 在收到结果后校验。
 
 多 GCP 账号的 run 与 SA 文件、执行项目、HF 输出位置关联，使用本地私有 `credentials/run-bindings.jsonl`，通过 `private_runs.py` 登记；不要写入公开 ledger 或云端产物。操作者（包括 LLM）的凭据选择与记账流程见 [私有绑定说明](credentials/README.md)。
 
