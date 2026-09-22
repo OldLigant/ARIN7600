@@ -23,12 +23,16 @@ class ModelBoundary:
     model = 'offline-fixture'
     def __init__(self, fail_review=False):
         self.calls = []
+        self.seen = []
         self.fail_review = fail_review
 
-    def generate(self, prompt, context, images, audio=None, max_output_tokens=16384):
+    def generate(self, prompt, context, images, audio=None, max_output_tokens=32768):
         ctx = json.loads(context)
         phase = ctx['task_phase']
         self.calls.append(phase)
+        self.seen.append({'prompt': prompt, 'context': ctx,
+                          'labels': [label for label, _ in images], 'audio': audio,
+                          'max_output_tokens': max_output_tokens})
         if phase == 'audio':
             assert audio.is_file() and not images
             data = {'summary': 'Tone.', 'utterances': [], 'sound_events': [], 'uncertainties': []}
@@ -91,7 +95,7 @@ def test_progress_reports_blocked_audio_and_stage_logs_survive_resume(source, tm
         if row['event'] == 'progress' and any(s['phase'] == 'audio' for s in row['telemetry']['active_stages']):
             audio_progress.set()
     class DelayedModel(ModelBoundary):
-        def generate(self, prompt, context, images, audio=None, max_output_tokens=16384):
+        def generate(self, prompt, context, images, audio=None, max_output_tokens=32768):
             if json.loads(context)['task_phase'] == 'audio':
                 assert audio_progress.wait(3), 'Heartbeat must run before the blocked audio call returns'
             return super().generate(prompt, context, images, audio, max_output_tokens)
@@ -111,7 +115,7 @@ def test_progress_reports_blocked_audio_and_stage_logs_survive_resume(source, tm
 
 def test_normalized_response_keeps_raw_evidence_and_flags_boundary_review(source, tmp_path):
     class UnorderedModel(ModelBoundary):
-        def generate(self, prompt, context, images, audio=None, max_output_tokens=16384):
+        def generate(self, prompt, context, images, audio=None, max_output_tokens=32768):
             result = super().generate(prompt, context, images, audio, max_output_tokens)
             if json.loads(context)['task_phase'] == 'annotation':
                 result['data']['segments'].reverse()
@@ -127,3 +131,39 @@ def test_normalized_response_keeps_raw_evidence_and_flags_boundary_review(source
     normalized = next(s for s in checkpoint['data']['segments'] if s['segment_id'] == 's006')
     assert normalized['start_sec'] == 12 and normalized['boundary']['start'] == 'uncertain'
     assert {c['code'] for c in checkpoint['normalization']} == {'SORT_SEGMENTS', 'NONEDGE_ONGOING_TO_UNCERTAIN'}
+
+
+def test_online_requests_mirror_the_canonical_request_spec(source, tmp_path):
+    """The runner must issue the same prompts, context and labels the batch
+    planner builds for the same clip, so an online smoke previews batch."""
+    from castle_pipeline import request_spec
+    provider = ModelBoundary()
+    cfg = RunConfig(tmp_path/'out', tmp_path/'scratch', workers=1, review=True)
+    meta = {'source_id': 'fixture'}
+    Pipeline(cfg, provider).run_source(source, meta)
+    prompts = {name: (Path(__file__).resolve().parents[1] / 'prompts' / f'{name}.md').read_text(encoding='utf-8')
+               for name in ('audio', 'annotation', 'review', 'review_regions')}
+    audio_call, annotation_call, review_call = provider.seen
+
+    assert audio_call['prompt'] == prompts['audio']
+    assert audio_call['context'] == request_spec.audio_stage_context(
+        request_spec.base_context('audio', 'fixture:0', 20.0, meta, 0.0))
+    assert audio_call['labels'] == []
+    assert audio_call['audio'] is not None
+
+    assert annotation_call['prompt'] == request_spec.annotation_prompt(
+        prompts, review_enabled=True, max_review_regions=4, exocentric=False)
+    expected = request_spec.annotation_stage_context(
+        request_spec.base_context('annotation', 'fixture:0', 20.0, meta, 0.0),
+        annotation_call['context']['frame_times_sec'],
+        {'summary': 'Tone.', 'utterances': [], 'sound_events': [], 'uncertainties': []}, True)
+    assert annotation_call['context'] == expected
+    assert list(annotation_call['context']) == list(expected)
+    assert annotation_call['labels'] == [request_spec.frame_label(i, t) for i, t in
+                                         enumerate(annotation_call['context']['frame_times_sec'])]
+    assert annotation_call['max_output_tokens'] == 32768
+
+    assert review_call['prompt'] == request_spec.review_prompt(prompts)
+    assert review_call['context']['crop_sources'] == [{'source_id': 'crop_0', 'time_sec': 0.0}]
+    assert review_call['labels'] == [request_spec.crop_label('crop_0', 0.0)]
+    assert review_call['context']['audio_input'] == 'absent'

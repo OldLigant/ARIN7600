@@ -16,6 +16,8 @@ import time
 import uuid
 from typing import Any, Callable
 
+from .request_spec import AUDIO_SOURCE_LABEL, DEFAULT_MAX_OUTPUT_TOKENS
+
 
 MAX_INLINE_BYTES = 18 * 1024 * 1024
 
@@ -210,7 +212,8 @@ class VertexProvider:
     def _contents(self, prompt: str, context: str, images: list[tuple[str, Path]], audio: Path | None):
         files = [(label, Path(path), None) for label, path in images]
         if audio is not None:
-            files.append((None, Path(audio), "audio/wav" if Path(audio).suffix.lower() == ".wav" else None))
+            files.append((AUDIO_SOURCE_LABEL, Path(audio),
+                          "audio/wav" if Path(audio).suffix.lower() == ".wav" else None))
         estimate = len(json.dumps([prompt, context], ensure_ascii=True).encode("utf-8")) + 4096
         sizes = []
         try:
@@ -222,21 +225,22 @@ class VertexProvider:
             if estimate > MAX_INLINE_BYTES:
                 raise ProviderError("Inline request exceeds 18 MiB; reduce image size or clip length.", "payload")
             parts = [{"text": context}]
+            # Media first, then its text label: the part order the released batch
+            # requests use, so an online request mirrors its batch counterpart.
             for (label, path, mime), size in zip(files, sizes):
                 with path.open("rb") as stream:
                     data = stream.read(size + 1)
                 if len(data) != size:
                     raise ProviderError("Media file changed while building the request.", "payload")
-                if label is not None:
-                    parts.append({"text": label})
                 parts.append({"inline_data": {"mime_type": mime or mimetypes.guess_type(path.name)[0]
                                               or "application/octet-stream", "data": data}})
+                parts.append({"text": label})
             return [{"role": "user", "parts": parts}]
         except OSError:
             raise ProviderError("Unable to read request media.", "payload") from None
 
     def generate(self, prompt: str, context: str, images: list[tuple[str, Path]],
-                 audio: Path | None = None, max_output_tokens: int = 16384) -> dict:
+                 audio: Path | None = None, max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS) -> dict:
         started = self.clock()
         try:
             metadata = json.loads(context)

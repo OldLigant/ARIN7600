@@ -6,6 +6,8 @@
 
 新增 **Vertex Batch 模式**：`batch_pipeline.py` 负责持久化、分阶段提交和一次性检查，`batch_jobs.py` 生成一次性 submit / 每小时 tick 的 HF Jobs。详细配置、ADC/GCS 权限、运行示例、恢复与停止定时任务见 [Batch 使用说明](docs/batch.md)。需要 GCS 和 Google ADC；现有在线 API key 不能替代。真实运行进度见带探测时间戳的 [STATUS.md](STATUS.md)。以下其余章节描述在线 `run_pipeline.py`。
 
+两种模式的**模型请求构造共享同一实现**（`castle_pipeline/request_spec.py`）：相同的基础提示词与后缀、相同的 context JSON 键序、相同的媒体标注与 part 顺序、相同的默认 `max_output_tokens`（32768）。规范形以已发布 Batch run（v1–v6）实际发出的请求为准，因此 Batch 请求字节不变，在线运行相当于同素材 Batch 请求的预演；差异只在传输层（inline base64 vs GCS `fileData`，以及 Batch 独有的 `CASTLE_BATCH_ID` 关联标记）和限流重试策略。
+
 多 GCP 账号的 run 与 SA 文件、执行项目、HF 输出位置关联，使用本地私有 `credentials/run-bindings.jsonl`，通过 `private_runs.py` 登记；不要写入公开 ledger 或云端产物。操作者（包括 LLM）的凭据选择与记账流程见 [私有绑定说明](credentials/README.md)。
 
 首次配置请阅读 [GCP 环境配置](docs/gcp-setup.md) 和 [Hugging Face 准备](docs/huggingface-setup.md)。完整阅读路线见 [文档导航](docs/README.md)，LLM agent 从 [AGENTS.md](AGENTS.md) 开始。
@@ -107,7 +109,7 @@ audio／annotation／review 检查点封装为 `{fingerprint,ok,result}`；final
 1. 验证配置指纹与 JSON 结构、时间范围、人物和证据引用。
 2. final 已完整则跳过；否则逐阶段复用。例如复核失败，只重跑复核模型请求。
 3. 媒体位于临时盘时，重启仍可能需要下载源文件并重新抽帧；复用指的是成功的模型阶段，不是保证所有本地 I/O 都省略。
-4. 指纹包括源身份／数据 commit、模型、service tier、采样设置、提示词及管线代码。改变它们会产生新输出分支；workers、RPM、重试次数和选取范围不影响既有标注身份，可以为恢复降低它们。
+4. 指纹包括源身份／数据 commit、模型、service tier、采样设置、`max_output_tokens`、提示词及管线代码。改变它们会产生新输出分支；workers、RPM、重试次数和选取范围不影响既有标注身份，可以为恢复降低它们。
 
 ```bash
 python run_pipeline.py status --output-dir /output/castle
@@ -155,7 +157,7 @@ hf jobs logs JOB_ID
 
 ## 配额与失败处理
 
-本节只适用于在线模式；大规模标注目前优先使用前述 Batch 流程。在线新运行使用 **standard**（也是在线 CLI 默认值）。用户已取消慢速 Flex 测试，不自动重提它；只有显式要求时才使用 Flex。切换 service tier 会改变标注指纹，不能把旧 Flex 检查点悄悄当作 standard 的结果。
+本节只适用于在线模式；大规模标注目前优先使用前述 Batch 流程。在线新运行使用 **standard**（也是在线 CLI 默认值）。用户已取消慢速 Flex 测试，不自动重提它；只有显式要求时才使用 Flex。切换 service tier 会改变标注指纹，不能把旧 Flex 检查点悄悄当作 standard 的结果。生成预算 `--max-output-tokens` 默认 32768，与 Batch 一致（此前在线硬编码 16384，思考 token 挤占输出导致内容密集 clip 被整段截断，v3 起 Batch 已修）；调整它会改变标注指纹。
 
 - 每个进程共用一个请求级 limiter，音频、主标注、复核及重试都计入；不是只限制视觉请求。
 - 默认最多 3 个 clip / 3 个同时 API 请求，初始 AIMD 窗口 2，成功后逐步增加，429／暂时服务故障／网络错误减半并共享退避；等待退避时释放请求槽。

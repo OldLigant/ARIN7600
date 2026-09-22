@@ -96,9 +96,9 @@ def test_request_preserves_parts_and_parses_usage(tmp_path, monkeypatch):
     assert req["config"]["max_output_tokens"] == 1234
     assert req["config"]["response_mime_type"] == "application/json"
     assert req["contents"] == [{"role": "user", "parts": [
-        {"text": "clip context"}, {"text": "t=0"},
-        {"inline_data": {"mime_type": "image/jpeg", "data": b"jpeg"}},
-        {"inline_data": {"mime_type": "audio/wav", "data": b"wave"}}]}]
+        {"text": "clip context"},
+        {"inline_data": {"mime_type": "image/jpeg", "data": b"jpeg"}}, {"text": "t=0"},
+        {"inline_data": {"mime_type": "audio/wav", "data": b"wave"}}, {"text": "source_id=audio_0"}]}]
 
 
 def test_adc_does_not_take_developer_api_key(monkeypatch):
@@ -108,6 +108,13 @@ def test_adc_does_not_take_developer_api_key(monkeypatch):
     provider(boundary).generate("p", "c", [])
     assert "api_key" not in boundary.options[0]
     assert boundary.options[0]["vertexai"] is True
+
+
+def test_default_generation_budget_matches_the_batch_default():
+    from castle_pipeline.request_spec import DEFAULT_MAX_OUTPUT_TOKENS
+    boundary = Boundary([response()])
+    provider(boundary).generate("p", "c", [])
+    assert boundary.requests[0]["config"]["max_output_tokens"] == DEFAULT_MAX_OUTPUT_TOKENS == 32768
 
 
 @pytest.mark.parametrize("service_key", [True, False])

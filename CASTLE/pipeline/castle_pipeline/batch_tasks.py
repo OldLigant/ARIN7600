@@ -9,17 +9,12 @@ from PIL import Image
 
 from .runner import atomic_json, cleanup_media
 from .media import positive_int
+from .request_spec import (DEFAULT_MAX_OUTPUT_TOKENS, AUDIO_SOURCE_LABEL, annotation_prompt,
+                           annotation_stage_context, audio_stage_context, base_context,
+                           crop_label, frame_label, review_prompt, review_stage_context)
 from .schema import validate_audio, normalize_annotation, apply_review
 
 MARKER = 'CASTLE_BATCH_ID:'
-
-# Thinking tokens share the generation budget with the visible answer, so a tight
-# cap truncates the JSON mid-document on content-heavy clips. Measured on
-# gemini-3.8-flash annotation: every MAX_TOKENS row landed at exactly 16384
-# combined (5-11k of it thinking), losing the whole clip. Both 32768 and 65536
-# are accepted by the Batch endpoint; this is a stored run parameter, not a
-# fingerprint input, so a resume can be retuned.
-DEFAULT_MAX_OUTPUT_TOKENS = 32768
 
 
 def request_row(request_id, prompt, context, media, max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
@@ -113,32 +108,27 @@ class TaskPlanner:
                     continue
                 meta = self.get_json(item['metadata_uri'])
                 request_id = stage + ':' + item['clip_id']
-                context = {'task_phase': stage, 'clip_id': item['clip_id'], 'duration_sec': meta['duration_sec'],
-                           'source': meta['source'], 'source_start_offset_sec': meta['start_offset_sec']}
+                context = base_context(stage, item['clip_id'], meta['duration_sec'],
+                                       meta['source'], meta['start_offset_sec'])
                 if stage == 'audio':
                     prompt = cfg['prompts']['audio']
-                    context['audio_source_id'] = 'audio_0'
-                    media = [('source_id=audio_0', meta['audio_uri'], 'audio/wav')]
+                    audio_stage_context(context)
+                    media = [(AUDIO_SOURCE_LABEL, meta['audio_uri'], 'audio/wav')]
                 elif stage == 'annotation':
                     audio = self.get_json(item['audio_uri'])
-                    prompt = cfg['prompts']['annotation'] + '\nThe audio_annotation is inherited audio_0 evidence from a separate raw-audio pass. No raw audio is supplied in this visual request. Do not guess visual speaker identity from voice proximity.'
-                    context.update(visual_source_id='video_0', visual_input='timestamped_frames',
-                                   frame_times_sec=meta['frame_times_sec'], audio_input='absent_in_this_request',
-                                   audio_annotation=audio['data'], audio_annotation_verification='audio_checked' if meta['audio_uri'] else 'absent',
-                                   ocr_input='absent', eye_tracking='absent', trusted_identity_mapping='absent',
-                                   timestamp_footer='Synthetic clip-local seconds; exclude footer from scene text.')
-                    if cfg.get('review', True):
-                        prompt += '\n' + cfg['prompts']['review_regions'].replace('MAX_REVIEW_REGIONS', str(cfg.get('max_review_regions', 4)))
-                    if meta['source'].get('viewpoint') == 'exocentric':
-                        prompt += '\nFIXED EXOCENTRIC camera: there is no wearer. Use person IDs, no I, and activity_chain=[].'
-                    media = [(f'frame_index={i}; clip_sec={t}; source_id=video_0', uri, 'image/jpeg')
+                    prompt = annotation_prompt(cfg['prompts'], review_enabled=cfg.get('review', True),
+                                               max_review_regions=cfg.get('max_review_regions', 4),
+                                               exocentric=meta['source'].get('viewpoint') == 'exocentric')
+                    annotation_stage_context(context, meta['frame_times_sec'], audio['data'],
+                                             bool(meta['audio_uri']))
+                    media = [(frame_label(i, t), uri, 'image/jpeg')
                              for i, (t, uri) in enumerate(zip(meta['frame_times_sec'], meta['frames']))]
                 elif stage == 'review':
                     first = self.get_json(item['annotation_uri'])
-                    context.update(annotation=first['data'], audio_input='absent',
-                                   crop_sources=[{'source_id': c['source_id'], 'time_sec': c['time_sec']} for c in item['crops']])
-                    prompt = cfg['prompts']['annotation'] + '\nFor this review use this replacement output contract instead:\n' + cfg['prompts']['review']
-                    media = [(f'source_id={c["source_id"]}; clip_sec={c["time_sec"]}', c['uri'], 'image/jpeg') for c in item['crops']]
+                    review_stage_context(context, first['data'],
+                                         [{'source_id': c['source_id'], 'time_sec': c['time_sec']} for c in item['crops']])
+                    prompt = review_prompt(cfg['prompts'])
+                    media = [(crop_label(c['source_id'], c['time_sec']), c['uri'], 'image/jpeg') for c in item['crops']]
                 else:
                     raise ValueError('Unknown batch stage')
                 ids.append(request_id)

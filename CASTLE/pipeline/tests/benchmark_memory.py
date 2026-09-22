@@ -33,7 +33,7 @@ class SerializingOfflineProvider:
         self.lock = threading.Lock()
         self.requests = []
 
-    def generate(self, prompt, context, images, audio=None, max_output_tokens=16384):
+    def generate(self, prompt, context, images, audio=None, max_output_tokens=32768):
         phase = json.loads(context)["task_phase"]
         started = time.monotonic()
         raw = [path.read_bytes() for _, path in images]

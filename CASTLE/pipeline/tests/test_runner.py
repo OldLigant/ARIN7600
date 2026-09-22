@@ -67,6 +67,17 @@ def test_run_config_rejects_unusable_media_tuning(tmp_path):
     assert (config.media_threads, config.decode_slots, config.footer_workers) == (4, 2, 3)
 
 
+def test_run_config_bounds_the_generation_budget(tmp_path):
+    """The online default matches Vertex Batch; the bound mirrors its CLI range."""
+    from castle_pipeline.request_spec import DEFAULT_MAX_OUTPUT_TOKENS
+    assert RunConfig(tmp_path, tmp_path).max_output_tokens == DEFAULT_MAX_OUTPUT_TOKENS == 32768
+    for kwargs in ({'max_output_tokens': 1023}, {'max_output_tokens': 65537},
+                   {'max_output_tokens': True}, {'max_output_tokens': 'x'}):
+        with pytest.raises(ValueError):
+            RunConfig(tmp_path, tmp_path, **kwargs)
+    assert RunConfig(tmp_path, tmp_path, max_output_tokens=65536).max_output_tokens == 65536
+
+
 def test_pipeline_builds_its_extractor_from_the_config(tmp_path):
     """The online path must honour the tuning knobs, not the old hardcoded 1/1."""
     config = RunConfig(tmp_path, tmp_path, media_threads=5, decode_slots=3, footer_workers=7)

@@ -16,6 +16,9 @@ import uuid
 from contextlib import contextmanager
 
 from .media import MediaExtractor, probe, env_decoder_default, env_footer_default, decoder_memory_warning
+from .request_spec import (DEFAULT_MAX_OUTPUT_TOKENS, annotation_prompt, annotation_stage_context,
+                           audio_stage_context, base_context, crop_label, frame_label,
+                           review_prompt, review_stage_context)
 from .schema import validate_annotation, validate_audio, apply_review, normalize_annotation
 from .vertex import ProviderError
 from .events import EventLog, ProgressReporter
@@ -221,6 +224,7 @@ class RunConfig:
     review: bool = True
     max_review_regions: int = 4
     stamp: bool = True
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     max_clips: int | None = None
     start_clip: int = 0
     memory_soft_limit_gib: float = 12.
@@ -237,6 +241,9 @@ class RunConfig:
             raise ValueError('Require workers 1..16, clip duration (0,30], sampling fps (0,4]')
         if not 128 <= self.max_dim <= 2880 or not 0 <= self.max_review_regions <= 8:
             raise ValueError('Invalid image dimensions or crop budget')
+        if isinstance(self.max_output_tokens, bool) or not isinstance(self.max_output_tokens, int) \
+                or not 1024 <= self.max_output_tokens <= 65536:
+            raise ValueError('Require max_output_tokens in 1024..65536')
         if self.start_clip < 0 or (self.max_clips is not None and self.max_clips < 1):
             raise ValueError('Invalid selected clip range')
         if not math.isfinite(self.memory_soft_limit_gib) or self.memory_soft_limit_gib <= 0:
@@ -270,6 +277,7 @@ class Pipeline:
             'service_tier': getattr(self.provider, 'service_tier', 'offline'),
             'fps': cfg.fps, 'clip_seconds': cfg.clip_seconds, 'max_dim': cfg.max_dim,
             'review': cfg.review, 'max_review_regions': cfg.max_review_regions, 'stamp': cfg.stamp,
+            'max_output_tokens': cfg.max_output_tokens,
             'prompts': self.prompts,
             'implementation': {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                for p in Path(__file__).parent.glob('*.py')}})
@@ -289,7 +297,7 @@ class Pipeline:
         started = time.monotonic()
         self.events.emit('stage_start', clip_id=clip_id, phase=name)
         result = self.provider.generate(prompt, json.dumps(context, ensure_ascii=False), images, audio=audio,
-                                        max_output_tokens=16384)
+                                        max_output_tokens=self.config.max_output_tokens)
         try:
             if normalizer is not None:
                 normalized, changes = normalizer(result['data'])
@@ -342,31 +350,27 @@ class Pipeline:
                 sources.add('audio_0')
             if not media.frame_paths:
                 raise ValueError('No usable sampled frames were decoded')
-            context = {'task_phase': 'audio', 'clip_id': f'{metadata["source_id"]}:{index}',
-                       'duration_sec': duration, 'source': metadata, 'source_start_offset_sec': start,
-                       'viewpoint': 'egocentric' if metadata.get('viewpoint', 'egocentric') == 'egocentric' else 'exocentric',
-                       'audio_source_id': 'audio_0' if media.audio_path else None}
+            exocentric = metadata.get('viewpoint') == 'exocentric'
             stage = 'audio'
             if media.audio_path:
-                audio = self._phase(checkpoint, 'audio', self.prompts['audio'], context, [], media.audio_path,
+                audio = self._phase(checkpoint, 'audio', self.prompts['audio'],
+                                    audio_stage_context(base_context('audio', clip_id, duration, metadata, start)),
+                                    [], media.audio_path,
                                     lambda data: validate_audio(data, duration))
             else:
                 audio = {'data': {'summary': 'No audio track supplied.', 'utterances': [], 'sound_events': [],
                                   'uncertainties': ['No audio evidence available.']}, 'usage': {}, 'skipped': True}
                 checkpoint.save('audio', audio)
                 self.events.emit('stage_skipped', clip_id=clip_id, phase='audio', reason='no_audio_track')
-            context.update(task_phase='annotation', visual_source_id='video_0', visual_input='timestamped_frames',
-                           frame_times_sec=media.frame_times, audio_input='absent_in_this_request',
-                           audio_annotation=audio['data'], audio_annotation_verification='audio_checked' if media.audio_path else 'absent',
-                           ocr_input='absent', eye_tracking='absent', trusted_identity_mapping='absent',
-                           timestamp_footer='Synthetic clip-local time outside original video content; do not annotate the footer as scene text.',
-                           sampling_note='Frame times label requested sample grid; source selection is quantized to the next available video frame. Do not infer subsecond motion.')
-            prompt = self.prompts['annotation'] + '\n\nThe audio_annotation is a separate raw-audio analysis of audio_0. You may cite its supported words/sounds as inherited audio evidence; this image request does not itself contain audio. Retain uncertain voice-to-person assignments. No supplied coarse activity labels are ground truth.'
-            if metadata.get('viewpoint') == 'exocentric':
-                prompt += '\nThis is a FIXED EXOCENTRIC camera: there is no wearer. Use person IDs for everyone; do not use I or a wearer actor, and activity_chain must be [].'
-            if cfg.review and cfg.max_review_regions:
-                prompt += '\n' + self.prompts['review_regions'].replace('MAX_REVIEW_REGIONS', str(cfg.max_review_regions))
-            images = [(f'frame_index={i}; clip_sec={t:.3f}; source_id=video_0', path)
+            # Request construction is shared with the batch planner: same context
+            # keys and order, same prompt suffixes, same media labels, so an
+            # online request mirrors its Vertex Batch counterpart byte-for-byte
+            # apart from inline data versus GCS URIs.
+            context = annotation_stage_context(base_context('annotation', clip_id, duration, metadata, start),
+                                               media.frame_times, audio['data'], bool(media.audio_path))
+            prompt = annotation_prompt(self.prompts, review_enabled=cfg.review,
+                                       max_review_regions=cfg.max_review_regions, exocentric=exocentric)
+            images = [(frame_label(i, t), path)
                       for i, (t, path) in enumerate(zip(media.frame_times, media.frame_paths))]
             def validate_first(data):
                 base = {key: value for key, value in data.items() if key != 'review_regions'}
@@ -395,6 +399,7 @@ class Pipeline:
             review = None
             if regions:
                 crop_images = []
+                crops = []
                 stage = 'crops'
                 crop_started = time.monotonic()
                 self.events.emit('stage_start', clip_id=clip_id, phase='crops', regions=len(regions))
@@ -405,15 +410,14 @@ class Pipeline:
                     self.extractor.extract_crop(source, start + t, region['box_2d'], path, max_dim=cfg.max_dim)
                     sid = f'crop_{i}'
                     sources.add(sid)
-                    crop_images.append((f'source_id={sid}; clip_sec={t:.3f}; label={region.get("label", "detail")}', path))
+                    crops.append({'source_id': sid, 'time_sec': t})
+                    crop_images.append((crop_label(sid, t), path))
                 self.events.emit('stage_success', clip_id=clip_id, phase='crops',
                                  elapsed_sec=round(time.monotonic() - crop_started, 3), regions=len(regions))
-                review_context = {'task_phase': 'review', 'clip_id': clip_id, 'duration_sec': duration, 'annotation': annotation,
-                                  'source': metadata, 'audio_input': 'absent',
-                                  'crop_sources': [label for label, _ in crop_images]}
+                review_context = review_stage_context(base_context('review', clip_id, duration, metadata, start),
+                                                      annotation, crops)
                 stage = 'review'
-                review_prompt = self.prompts['annotation'] + '\n\nFOR THIS REVIEW, use the following replacement output contract instead of the primary annotation output:\n' + self.prompts['review']
-                review = self._phase(checkpoint, 'review', review_prompt, review_context, crop_images, None,
+                review = self._phase(checkpoint, 'review', review_prompt(self.prompts), review_context, crop_images, None,
                                      lambda data: apply_review(annotation, data, duration, sources))
                 annotation = apply_review(annotation, review['data'], duration, sources)
             else:

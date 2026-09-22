@@ -66,6 +66,9 @@ def parser():
     run.add_argument('--max-clips', type=int, help='Cap clips per source, not a global cap')
     run.add_argument('--no-review', action='store_true')
     run.add_argument('--max-review-regions', type=int, default=4)
+    run.add_argument('--max-output-tokens', type=int, default=32768,
+                     help='Generation budget shared by thinking and visible output; default 32768, '
+                          'matching Vertex Batch so smoke results predict batch behaviour')
     run.add_argument('--no-stamp', action='store_true')
     run.add_argument('--keep-media', action='store_true', help='Retain sampled frames/crops for inspection; consumes scratch disk')
     run.add_argument('--keep-source', action='store_true', help='Retain managed downloaded source; check disk before long runs')
@@ -122,6 +125,7 @@ def main(argv=None):
     config = RunConfig(args.output_dir, args.scratch_dir, workers=args.workers, fps=args.fps,
                        clip_seconds=args.clip_seconds, max_dim=args.max_dim, review=not args.no_review,
                        max_review_regions=args.max_review_regions, stamp=not args.no_stamp,
+                       max_output_tokens=args.max_output_tokens,
                        max_clips=args.max_clips, start_clip=args.start_clip,
                        memory_soft_limit_gib=args.memory_soft_limit_gib, keep_media=args.keep_media,
                        progress_interval_sec=args.progress_interval_sec,
